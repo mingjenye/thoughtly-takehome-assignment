@@ -925,6 +925,167 @@ User (any region) → Geographic Router → Event's Primary DB Region
 
 **Scalability:** For >100K concurrent users, consider Redis queue + worker pool.
 
+### 8. Real-time Updates Strategy (Ticket Availability & Queue Position)
+
+**Decision:** Currently using client-side polling (manual refresh on page load).
+
+**Why Real-time Updates Matter:**
+
+For high-demand events, real-time updates significantly improve user experience:
+- Users see instant feedback on ticket availability changes
+- Queue position updates in real-time (no manual refresh)
+- Immediate sold-out notifications reduce frustration
+- Live seat maps show what others are booking
+
+**Evaluated Approaches:**
+
+#### Option 1: Long Polling (Simplest)
+
+**Mechanism:** Client sends repeated HTTP requests at fixed intervals.
+
+```typescript
+// Client polls server every 3 seconds
+setInterval(async () => {
+  const data = await fetch('/api/tickets?eventId=1');
+  updateUI(data);
+}, 3000);
+```
+
+**Characteristics:**
+- Latency: 1-5 seconds (based on polling interval)
+- Server load: High (N users × 20 requests/minute)
+- Implementation: Simple (standard HTTP)
+- Bandwidth: Wasteful (requests even when no changes)
+
+**Best for:**
+- Short browsing sessions (<5 minutes)
+- Low-traffic events (<1K concurrent viewers)
+- Quick prototypes and demos
+
+#### Option 2: SSE (Server-Sent Events) (Recommended)
+
+**Mechanism:** Server pushes updates to client over persistent HTTP connection.
+
+```typescript
+// Client: Native EventSource API
+const eventSource = new EventSource('/events/123/stream');
+eventSource.onmessage = (e) => {
+  const data = JSON.parse(e.data);
+  updateSeatMap(data.available);
+};
+
+// Server: Push updates after each booking
+res.write(`data: ${JSON.stringify({ available: { VIP: 45 } })}\n\n`);
+```
+
+**Characteristics:**
+- Latency: <1 second (instant push)
+- Server load: Low (one connection per user)
+- Implementation: Simple (native browser API)
+- Communication: One-way (server → client only)
+- Auto-reconnect: Built-in
+
+**Best for:**
+- Ticket availability updates (server-initiated)
+- Queue position notifications
+- Moderate traffic (1K-50K concurrent)
+- Works with existing HTTP infrastructure
+
+#### Option 3: WebSocket (Maximum Real-time)
+
+**Mechanism:** Full bidirectional persistent connection.
+
+```typescript
+// Client: Socket.IO or native WebSocket
+const socket = io('https://api.ticketing.com');
+socket.on('ticket_update', (data) => updateSeatMap(data));
+socket.emit('subscribe_event', eventId);
+
+// Server: Broadcast to all subscribers
+io.to(`event_${eventId}`).emit('ticket_update', { available: 45 });
+```
+
+**Characteristics:**
+- Latency: <100ms (near-instant)
+- Server load: Medium (persistent connections)
+- Implementation: Complex (Socket.IO/ws library)
+- Communication: Bidirectional
+- Reconnection: Manual handling needed
+
+**Best for:**
+- Hot events (>50K concurrent viewers)
+- Virtual queue with instant position updates
+- Interactive features (seat selection, live chat)
+- Sub-100ms latency requirements
+
+**Trade-offs: Long Polling vs SSE vs WebSocket**
+
+| Aspect | Long Polling | SSE | WebSocket |
+|--------|-------------|-----|-----------|
+| **Update Latency** | 1-5 sec  | <1 sec  | <100ms  |
+| **Server Load** | High  | Low  | Medium  |
+| **Bandwidth Usage** | Wasteful  | Efficient  | Efficient  |
+| **Implementation** | Simplest  | Simple  | Complex  |
+| **Browser Support** | All  | Modern | All  |
+| **Communication** | Request-based | One-way | Bidirectional  |
+| **Auto-reconnect** | N/A | Built-in  | Manual ⚠️ |
+| **Firewall/Proxy** | Always works  | Usually works  | May block ⚠️ |
+| **Scalability** | Poor ❌ | Good  | Good  |
+| **Connection Limit** | None | 6 per domain | Unlimited |
+| **Best Use Case** | Short visits | Ticket updates | Hot events |
+
+**Recommended Architecture (Tiered by Demand):**
+
+```
+Normal Events (<1K concurrent viewers):
+├─ Long polling (5-second interval)
+├─ Minimal infrastructure
+└─ Good enough for low traffic
+
+Popular Events (1K-50K concurrent):
+├─ SSE (Server-Sent Events) ← Recommended
+├─ One connection per user
+├─ Real-time availability updates
+└─ Low server overhead
+
+Hot Events (>50K concurrent):
+├─ WebSocket with Redis pub/sub
+├─ Instant updates (<100ms)
+├─ Scales with Redis broadcast
+└─ Virtual queue integration
+```
+
+**Implementation Complexity vs User Benefit:**
+
+| Users Watching | Method | Implementation Time | User Benefit |
+|---------------|--------|-------------------|--------------|
+| <1K | Long Polling | 1 hour | Low (3-5s delay acceptable) |
+| 1K-50K | SSE | 4-6 hours | High (instant updates) |
+| >50K | WebSocket | 8-12 hours | Critical (near real-time) |
+
+**Decision for Current Scope:**
+
+Not implemented (manual refresh only) because:
+1. **Focus Priority**: Core concurrency control (double-booking prevention)
+2. **Demo Value**: Real-time updates don't showcase locking logic
+3. **Time Constraint**: Can be added incrementally based on demand
+4. **Sufficient**: For demo purposes, manual refresh demonstrates functionality
+
+**Next Development Step:**
+
+Implement **SSE** as the next feature:
+- Simpler than WebSocket (native browser API)
+- Sufficient for most use cases (1K-50K users)
+- Works with existing HTTP infrastructure
+- Natural upgrade from polling
+
+**Pattern:**
+- SSE stream: Server pushes availability updates (real-time)
+- HTTP POST: Client sends booking requests (as current)
+- Clean separation of concerns
+
+See "Scalability Considerations → Real-time Communication" for scaling strategy.
+
 ## 📈 Scalability Considerations
 
 ### Achieving 99.99% Availability
@@ -1125,6 +1286,36 @@ User (any region) → Geographic Router → Event's Primary DB Region
    - Need >100K concurrent bookings (Virtual Queue insufficient)
    - Want sophisticated retry logic for payment providers
    - Async UX becomes acceptable/preferred
+
+7. **Real-time Communication Infrastructure**
+
+   **Purpose:** Push live updates to users (ticket availability, queue position, sold-out notifications).
+
+   **Scaling by Traffic:**
+   
+   ```
+   <1K viewers:    Long polling (manual refresh acceptable)
+   1K-50K viewers: SSE (Server-Sent Events) ← Recommended next step
+   >50K viewers:   WebSocket + Redis pub/sub (for hot events)
+   ```
+   
+   **Implementation Strategy:**
+   
+   - **SSE for moderate traffic** (1K-50K concurrent)
+     - Native browser EventSource API
+     - Server pushes availability updates after each booking
+     - Low overhead, built-in auto-reconnect
+     - One-way communication (sufficient for ticket updates)
+     - Works with existing HTTP infrastructure
+   
+   - **WebSocket for hot events** (>50K concurrent)
+     - Socket.IO with Redis adapter for multi-server broadcast
+     - Bidirectional for interactive features (virtual queue control)
+     - Redis pub/sub enables horizontal scaling
+     - Sub-100ms latency for instant position updates
+     - Supports complex scenarios (live seat selection, chat)
+   
+   **Current Decision:** Not implemented to focus on core concurrency control. See "Design Decisions → Real-time Updates Strategy" for detailed approach comparison (Long Polling vs SSE vs WebSocket).
 
 ### Performance: p95 < 500ms
 
