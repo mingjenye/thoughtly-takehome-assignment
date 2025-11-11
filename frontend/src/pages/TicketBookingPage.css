@@ -1,0 +1,394 @@
+.ticket-booking-page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+.page-header {
+  text-align: center;
+  margin-bottom: 3rem;
+}
+
+.page-header h1 {
+  font-size: 2.5rem;
+  margin-bottom: 0.5rem;
+  color: #333;
+}
+
+.page-header p {
+  font-size: 1.1rem;
+  color: #666;
+}
+
+.error-banner {
+  background-color: #fee;
+  color: #c00;
+  padding: 1rem;
+  border-radius: 8px;
+  margin-bottom: 1.5rem;
+  border: 1px solid #fcc;
+}
+
+.success-banner {
+  background-color: #efe;
+  color: #0a0;
+  padding: 1rem;
+  border-radius: 8px;
+  margin-bottom: 1.5rem;
+  border: 1px solid #cfc;
+}
+
+.loading {
+  text-align: center;
+  padding: 4rem;
+  font-size: 1.2rem;
+  color: #666;
+}
+
+.booking-container {
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+}
+
+.user-id-section {
+  background: #f9f9f9;
+  padding: 1.5rem;
+  border-radius: 8px;
+  border: 2px solid #ddd;
+}
+
+.user-id-section label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-size: 1.1rem;
+}
+
+.user-id-input {
+  width: 100%;
+  padding: 0.75rem;
+  font-size: 1rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  max-width: 300px;
+}
+
+.tickets-section h2 {
+  font-size: 1.8rem;
+  margin-bottom: 1.5rem;
+  color: #333;
+}
+
+.tickets-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1.5rem;
+  margin-bottom: 2rem;
+}
+
+.ticket-card {
+  background: white;
+  border: 2px solid #e0e0e0;
+  border-radius: 12px;
+  overflow: hidden;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.ticket-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.ticket-header {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  padding: 1.5rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.ticket-header h3 {
+  font-size: 1.5rem;
+  margin: 0;
+}
+
+.ticket-price {
+  font-size: 1.8rem;
+  font-weight: bold;
+}
+
+.ticket-body {
+  padding: 1.5rem;
+}
+
+.available-count {
+  font-size: 1rem;
+  color: #666;
+  margin-bottom: 1rem;
+}
+
+.quantity-selector {
+  margin-top: 1rem;
+}
+
+.quantity-selector label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: 500;
+}
+
+.quantity-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.quantity-controls button {
+  width: 40px;
+  height: 40px;
+  font-size: 1.5rem;
+  border: 1px solid #ccc;
+  background: white;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.quantity-controls button:hover:not(:disabled) {
+  background: #f0f0f0;
+  border-color: #999;
+}
+
+.quantity-controls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.quantity-input {
+  width: 80px;
+  padding: 0.5rem;
+  text-align: center;
+  font-size: 1.1rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.subtotal {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid #eee;
+  font-weight: bold;
+  color: #667eea;
+  font-size: 1.1rem;
+}
+
+.booking-summary {
+  background: #f9f9f9;
+  padding: 2rem;
+  border-radius: 12px;
+  border: 2px solid #ddd;
+}
+
+.booking-summary h3 {
+  font-size: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.summary-details {
+  margin-bottom: 1.5rem;
+}
+
+.summary-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #ddd;
+}
+
+.summary-total {
+  display: flex;
+  justify-content: space-between;
+  padding: 1rem 0;
+  font-size: 1.3rem;
+  color: #333;
+  border-top: 2px solid #333;
+  margin-top: 1rem;
+}
+
+.reserve-button {
+  width: 100%;
+  padding: 1rem;
+  font-size: 1.2rem;
+  font-weight: bold;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.reserve-button:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.reserve-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Confirmation Step */
+.confirmation-container {
+  background: white;
+  padding: 2rem;
+  border-radius: 12px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.confirmation-container h2 {
+  font-size: 2rem;
+  margin-bottom: 2rem;
+  text-align: center;
+  color: #333;
+}
+
+.reserved-tickets-list {
+  background: #f9f9f9;
+  padding: 1.5rem;
+  border-radius: 8px;
+  margin-bottom: 2rem;
+}
+
+.reserved-tickets-list h3 {
+  font-size: 1.3rem;
+  margin-bottom: 1rem;
+}
+
+.reserved-ticket-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.75rem;
+  background: white;
+  border-radius: 4px;
+  margin-bottom: 0.5rem;
+  border: 1px solid #ddd;
+}
+
+.payment-info {
+  background: #f9f9f9;
+  padding: 1.5rem;
+  border-radius: 8px;
+  margin-bottom: 2rem;
+}
+
+.payment-info h3 {
+  font-size: 1.3rem;
+  margin-bottom: 1rem;
+}
+
+.payment-details p {
+  font-size: 1.1rem;
+  margin-bottom: 1rem;
+}
+
+.payment-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.payment-input {
+  padding: 0.75rem;
+  font-size: 1rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fafafa;
+}
+
+.payment-row {
+  display: flex;
+  gap: 1rem;
+}
+
+.payment-note {
+  font-size: 0.9rem;
+  color: #666;
+  font-style: italic;
+}
+
+.confirmation-buttons {
+  display: flex;
+  gap: 1rem;
+  margin-top: 2rem;
+}
+
+.confirm-button {
+  flex: 1;
+  padding: 1rem;
+  font-size: 1.2rem;
+  font-weight: bold;
+  background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.confirm-button:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.confirm-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.simulate-fail-button {
+  flex: 1;
+  padding: 1rem;
+  font-size: 1rem;
+  background: #f44336;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.simulate-fail-button:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.simulate-fail-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.success-message {
+  margin-top: 1.5rem;
+  padding: 1.5rem;
+  background: #efe;
+  color: #0a0;
+  border-radius: 8px;
+  text-align: center;
+  font-size: 1.2rem;
+  font-weight: bold;
+}
+
+@media (max-width: 768px) {
+  .tickets-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .confirmation-buttons {
+    flex-direction: column;
+  }
+
+  .payment-row {
+    flex-direction: column;
+  }
+}
+
