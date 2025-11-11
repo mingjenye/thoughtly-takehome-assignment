@@ -249,8 +249,6 @@ updated_at TIMESTAMP
 
 ### 1. Simplified User Management (Authentication Not Implemented)
 
-⚠️ **Current System Uses Simplified Authentication for Demo Purposes**
-
 **Decision:** No authentication system; users are identified by manually entered user ID only.
 
 **Simplified Authentication Approach: (current)**
@@ -286,7 +284,9 @@ JWT (JSON Web Token) authentication provides several advantages:
 
 ### 2. Single Event System
 **Decision:** All tickets belong to event_id = 1.
+
 **Rationale:** Simplifies the system while demonstrating core booking functionality.
+
 **Scalability:** Database schema supports multiple events, easy to extend.
 
 ### 3. Ticket ID Strategy (PostgreSQL SERIAL vs. Globally Unique IDs)
@@ -379,20 +379,162 @@ Example: 1234567890123456789
 - ❌ Slightly lower throughput than optimistic locking
 **Alternative:** Optimistic locking with version numbers would require retry logic.
 
-### 5. Two-Step Booking (Reserve → Confirm)
+### 5. Global Users Architecture (Multi-Region Deployment)
+
+**Requirement:** Users may book from any country (single currency: USD).
+
+**Current Implementation:** Single-region deployment.
+
+**Why Multi-Region Matters:**
+For a global ticketing system, users distributed across continents (US, EU, ASIA) require different strategies for read and write operations to balance latency, consistency, and correctness.
+
+**Global Deployment Strategy:**
+
+The system needs different consistency guarantees for different operations:
+- **Eventual Consistency** for reads (browsing events, viewing ticket counts)
+- **Strong Consistency** for writes (booking tickets, payment confirmation)
+
+#### Read Path (Eventual Consistency Acceptable)
+
+**Goal:** Minimize latency for 95% of operations (browsing, searching).
+
+**Architecture:**
+```
+User (any region) → CDN (edge location) → Regional Redis Cache → Primary DB
+                     ↓                      ↓                      ↓
+                  Static UI               Event listings         Real-time count
+                  (instant)               (10s stale OK)         (if cache miss)
+```
+
+**Multi-Layer Caching:**
+1. **CDN Layer** (CloudFront/Cloudflare)
+   - Frontend static assets (HTML, JS, CSS)
+   - Event listing API responses (TTL: 1-5 minutes)
+   - Cached at edge locations closest to users
+
+2. **Regional Redis Cache**
+   - Event details (TTL: 5 minutes)
+   - Available ticket counts (TTL: 10 seconds)
+   - Search query results (TTL: 1 minute)
+
+**Why Stale Data is Acceptable:**
+- User sees "100 tickets available" (actually 95 available)
+- When user clicks "Book", system checks real-time availability at write time. (We will discuss the real-time ticket seat availability scenareo in the "Scalability Considerations" chapter.)
+- If sold out, booking fails gracefully with clear error message
+- Trade-off: Slightly outdated info for much lower latency (50ms vs 300ms)
+
+**Geographic DNS Routing:**
+```
+GeoDNS automatically routes users to nearest endpoint:
+- US users     → us-api.ticketing.com   → US CDN/Cache/Replica
+- EU users     → eu-api.ticketing.com   → EU CDN/Cache/Replica
+- ASIA users   → asia-api.ticketing.com → ASIA CDN/Cache/Replica
+```
+
+#### Write Path (Strong Consistency Required)
+
+**Goal:** Guarantee correctness (no double-booking) even with higher latency.
+
+**Architecture:**
+```
+User (any region) → Geographic Router → Event's Primary DB Region
+                                                   ↓
+                                          PostgreSQL Transaction
+                                          + Row-Level Locking
+                                          (FOR UPDATE SKIP LOCKED)
+                                                   ↓
+                                          Single Source of Truth
+```
+
+**Booking Flow:**
+1. User in EU books ticket for US event
+2. Request routed to event's primary database (US)
+3. PostgreSQL row-level lock ensures atomicity
+4. Ticket marked as 'pending' or 'booked'
+5. Response returns to EU user (~150-300ms total)
+
+**Why Route to Primary:**
+- **Single Source of Truth**: All bookings for an event go to same database
+- **ACID Guarantees**: PostgreSQL transaction ensures consistency
+- **No Distributed Locks**: Avoid complex coordination between regions
+- **Row-Level Locking**: `FOR UPDATE SKIP LOCKED` prevents race conditions
+
+**Consistency Guarantee:**
+- ✅ No double-booking across regions
+- ✅ Idempotent ticket IDs prevent duplicates
+- ✅ Strong consistency at write time (slight latency acceptable)
+- ❌ Cross-region writes have higher latency (100-300ms ocean round-trip)
+
+#### Trade-offs: Event-Based vs. User-Based Sharding
+
+**Strategy Comparison:**
+
+| Aspect | Event-Based Sharding | User-Based Geographic Sharding |
+|--------|---------------------|-------------------------------|
+| **Sharding Key** | `event_id` | `user_region` |
+| **Data Distribution** | All tickets for one event in same region | Users and their bookings in home region |
+| **Cross-Region Writes** | Common (EU user books US event) | Rare (most events in user's region) |
+| **Write Latency** | Higher for cross-region users | Lower (write to local region) |
+| **Consistency Model** | Simple (single DB per event) | Complex (distributed transactions) |
+| **Popular Event Handling** | All load to one region ⚠️ | Distributed across regions ✅ |
+| **Database Transactions** | ACID within single DB ✅ | May require 2PC across DBs ❌ |
+| **Implementation Complexity** | Low (easy to debug) | High |
+
+**Why Event-Based Sharding:**
+
+1. **Correctness Over Speed**: For bookings, preventing double-booking is more important than minimizing latency
+2. **Simpler Architecture**: Single database per event means standard PostgreSQL ACID transactions work
+3. **Acceptable Latency**: 200-300ms for booking is acceptable when users wait days for tickets
+4. **Proven Pattern**: Used by Ticketmaster, Eventbrite, and other major ticketing platforms
+
+**Optimization for Globally Hot Events: Read-Heavy Optimization + Controlled Write Path**
+
+1. **Optimize Read Path** (No Throttling)
+   - CDN serves event pages instantly
+   - WebSocket provides real-time seat availability updates
+   - Users browse freely with live ticket count updates
+
+2. **Control Write Path** (Virtual Queue)
+   - Throttle concurrent bookings (e.g., 500 simultaneous transactions)
+   - Other users wait in virtual queue with visible position
+   - Batch release: Every N bookings, admit next batch of users
+   - Fair FIFO queue prevents stampede and database overload
+   - See "Scalability Considerations" section for details.
+
+3. **User Experience**
+   - Most time spent browsing (fast, real-time)
+   - Queue wait when booking (acceptable, transparent)
+   - Clear position updates and estimated wait time
+
+#### Performance Targets
+
+| User Location | Operation | Target Latency (p95) | Strategy |
+|---------------|-----------|---------------------|----------|
+| Same Region | Browse events | < 50ms | CDN + Regional cache |
+| Same Region | Book ticket | < 150ms | Local primary DB |
+| Cross-Region | Browse events | < 100ms | CDN + Regional cache |
+| Cross-Region | Book ticket | < 300ms | Route to event's primary DB |
+
+**Key Insight:** [Users spend 5-10 minutes browsing (fast) before 1 booking action (acceptable latency)](https://planethms.com/the-impact-of-user-experience-design-enhancing-your-booking-engine/). Optimizing the read path with caching provides the best overall user experience.
+
+### 6. Two-Step Booking (Reserve → Confirm)
 **Decision:** Separate reserve and confirm steps.
+
 **Rationale:**
 - Mimics real-world payment flow
 - Allows time for payment processing
 - Can release tickets if payment fails
+
 **Trade-off:** Tickets temporarily unavailable during payment (acceptable for this use case).
 
-### 6. In-Memory vs. Database Queue
+### 7. In-Memory vs. Database Queue
 **Decision:** Direct database transactions, no message queue.
+
 **Rationale:**
 - Sufficient for ~50K concurrent users
 - Simpler architecture
 - PostgreSQL can handle the load
+
 **Scalability:** For >100K concurrent users, consider Redis queue + worker pool.
 
 ## 📈 Scalability Considerations
