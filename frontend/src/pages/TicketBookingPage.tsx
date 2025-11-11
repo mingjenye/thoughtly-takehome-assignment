@@ -3,11 +3,37 @@ import { ticketsAPI, bookingAPI } from '../services/api';
 import { TierInfo, Ticket } from '../types';
 import './TicketBookingPage.css';
 
+/**
+ * AUTHENTICATION LAYER IMPLEMENTATION NOTE:
+ * 
+ * CURRENT: Users manually enter their userId
+ *   - userId stored in component state
+ *   - No login/logout functionality
+ *   - Anyone can impersonate any user
+ * 
+ * TODO: Implementation:
+ *   1. Remove manual userId input field
+ *   2. User must login first (redirect to /login if not authenticated)
+ *   3. Store JWT token in localStorage after successful login
+ *   4. Create AuthContext to manage authentication state globally
+ *   5. Backend extracts userId from JWT token, not from request body
+ * 
+ * Example AuthContext usage:
+ *   const { user, isAuthenticated } = useAuth();
+ *   if (!isAuthenticated) {
+ *     return <Navigate to="/login" />;
+ *   }
+ *   // Use user.id, user.name, user.email from context
+ */
 export const TicketBookingPage: React.FC = () => {
   const [tiers, setTiers] = useState<TierInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  
+  // TODO: Remove this state, get user from AuthContext instead
+  // Current: Manual userId input (NOT SECURE)
   const [userId, setUserId] = useState<string>('');
+  
   const [selectedTickets, setSelectedTickets] = useState<Record<string, number>>({
     VIP: 0,
     'Front Row': 0,
@@ -49,6 +75,7 @@ export const TicketBookingPage: React.FC = () => {
   };
 
   const handleReserveTickets = async () => {
+    // TODO: Remove this check, user will already be authenticated
     if (!userId) {
       setError('Please enter your User ID');
       return;
@@ -66,8 +93,12 @@ export const TicketBookingPage: React.FC = () => {
     try {
       setIsProcessing(true);
       setError(null);
+      
+      // TODO: Remove userId from request body
+      // Backend will extract userId from JWT token automatically
+      // Updated call: await bookingAPI.reserve({ eventId: 1, tickets: ticketsToReserve });
       const response = await bookingAPI.reserve({
-        userId: parseInt(userId),
+        userId: parseInt(userId), // NOT SECURE: Remove this field
         eventId: 1,
         tickets: ticketsToReserve,
       });
@@ -86,8 +117,11 @@ export const TicketBookingPage: React.FC = () => {
     try {
       setIsProcessing(true);
       setError(null);
+      
+      // TODO: Remove userId from request body
+      // Backend will extract userId from JWT token automatically
       const response = await bookingAPI.confirm({
-        userId: parseInt(userId),
+        userId: parseInt(userId), // NOT SECURE: Remove this field
         ticketIds: reservedTickets.map(t => t.id),
         paymentSimulation: paymentSuccess ? 'success' : 'fail',
       });
@@ -145,6 +179,21 @@ export const TicketBookingPage: React.FC = () => {
 
       {bookingStep === 'select' && (
         <div className="booking-container">
+          {/* 
+            TODO: Replace this manual userId input with proper authentication
+            
+            This section should be removed and replaced with:
+            1. A welcome message showing the logged-in user's name
+            2. A logout button
+            
+            Example:
+              <div className="user-info-section">
+                <p>Welcome, {user.name}!</p>
+                <button onClick={handleLogout}>Logout</button>
+              </div>
+            
+            Users should be redirected to /login if not authenticated
+          */}
           <div className="user-id-section">
             <label htmlFor="userId">
               <strong>Your User ID:</strong>

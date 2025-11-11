@@ -60,7 +60,7 @@ This is a ticket booking system that allows users to:
 ### 1. Clone the Repository
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/mingjenye/thoughtly-takehome-assignment.git
 cd Thoughtly-takehome-assignment
 ```
 
@@ -247,10 +247,42 @@ updated_at TIMESTAMP
 
 ## 🎭 Design Decisions & Trade-offs
 
-### 1. Simplified User Management
-**Decision:** No authentication system, users identified by ID only.
-**Rationale:** Assignment focuses on booking logic and concurrency, not auth.
-**Production:** Would require JWT-based auth, password hashing, sessions.
+### 1. Simplified User Management (Authentication Not Implemented)
+
+⚠️ **Current System Uses Simplified Authentication for Demo Purposes**
+
+**Decision:** No authentication system; users are identified by manually entered user ID only.
+
+**Simplified Authentication Approach: (current)**
+- Users manually enter their `userId` in the frontend, which is sent to the backend in the request body without verification.
+- This allows for rapid development and easy testing of core booking logic and race condition handling—highlighting transaction safety and concurrency control without the overhead of implementing login/auth flows.
+- **Security Risk:** Anyone can impersonate any user, as there is no user verification.
+- **Rationale:** Prioritized core booking functionality, database transaction handling, and demonstration of concurrency control over secure authentication, to meet project time constraints and keep the demo clear and focused.
+
+**Trade-offs:**
+| Aspect | Current (Simplified) | Next Step (JWT Auth) |
+|--------|---------------------|----------------------|
+| **Security** | ❌ No user verification | ✅ Token-based authentication |
+| **Development Time** | ✅ Fast implementation | ⚠️ Additional 4-6 hours |
+| **Testing** | ✅ Easy to test multiple users | ⚠️ Need login for each scenario |
+| **Demo Clarity** | ✅ Clear booking flow focus | ⚠️ Auth adds complexity |
+
+**Why JWT Auth Would Be Better:**
+JWT (JSON Web Token) authentication provides several advantages:
+- **User Verification**: Backend can trust the user identity from the signed token
+- **Stateless**: No session storage needed on the server
+- **Scalability**: Works across multiple backend instances without shared state
+- **Industry Standard**: Well-established pattern for RESTful APIs
+- **Prevents Impersonation**: Users cannot fake another user's identity
+
+**JWT Mechanism Overview:**
+```
+1. User Login → Backend verifies credentials → Returns signed JWT token
+2. Frontend stores token (localStorage/cookie)
+3. Every API request includes token in Authorization header
+4. Backend verifies token signature and extracts user info
+5. Request processed with authenticated user context
+```
 
 ### 2. Single Event System
 **Decision:** All tickets belong to event_id = 1.

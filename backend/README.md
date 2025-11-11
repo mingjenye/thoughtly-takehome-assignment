@@ -149,10 +149,46 @@ All errors are handled by the centralized error handler middleware. Custom error
 - `ValidationError` (422)
 
 ### Authentication
-JWT-based authentication. Include token in Authorization header:
+
+**TODO NOTE - Authentication Not Yet Implemented**
+
+#### Current Implementation (Simplified)
+- Users manually enter their `userId` in the frontend
+- The `userId` is sent in the request body to the backend
+- **Security Risk**: Anyone can impersonate any user by changing the `userId`
+
+#### Why This Approach?
+
+**Purpose for Take-Home Exam:**
+- Focus on demonstrating core booking logic and race condition prevention
+- Quick testing and demonstration without login complexity
+- Faster development to showcase transaction handling and concurrency control
+
+**Trade-offs:**
+| Aspect | Current (Simplified) | Next Step (JWT Auth) |
+|--------|---------------------|----------------------|
+| **Security** | ❌ No user verification | ✅ Token-based authentication |
+| **Testing** | ✅ Easy to test multiple users | ⚠️ Need login for each test |
+| **User Experience** | ❌ Manual ID entry | ✅ Seamless after login |
+
+#### Why JWT Auth Would Be Better
+JWT (JSON Web Token) authentication provides:
+- **User Verification**: Backend can trust the user identity from the signed token
+- **Stateless**: No session storage needed on the server
+- **Scalability**: Works across multiple backend instances
+- **Industry Standard**: Well-established pattern for RESTful APIs
+
+#### JWT Mechanism Overview
+
 ```
-Authorization: Bearer YOUR_TOKEN_HERE
+1. User Login → Backend verifies credentials → Returns signed JWT token
+2. Frontend stores token (localStorage/cookie)
+3. Every API request includes token in Authorization header
+4. Backend verifies token signature and extracts user info
+5. Request processed with authenticated user context
 ```
+
+See inline code comments in controllers for specific implementation points.
 
 ### Validation
 Request validation is done using Joi schemas in the validators directory.
