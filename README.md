@@ -1089,135 +1089,6 @@ See "Scalability Considerations → Real-time Communication" for scaling strateg
 
 ## 📈 Scalability Considerations
 
-### 🏗️ Target Architecture Overview (Production Scale)
-
-**Complete system architecture with all optimizations implemented for 1M DAU, 50K concurrent users:**
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                         GLOBAL USERS (1M DAU)                      │
-│         US Region            EU Region            ASIA Region      │
-│         (300K users)         (400K users)         (300K users)     │
-└──────────┬──────────────────────┬──────────────────────┬───────────┘
-           │                      │                      │
-           ▼                      ▼                      ▼
-┌─────────────────────┬─────────────────────┬────────────────────────┐
-│   CDN Layer (L1)    │   CDN Layer (L1)    │   CDN Layer (L1)       │ ← Edge Cache
-│  • Static assets    │  • Static assets    │  • Static assets       │   (60% hits)
-│  • API cache 1-5min │  • API cache 1-5min │  • API cache 1-5min    │
-└──────────┬──────────┴───────────┬─────────┴────────────┬───────────┘
-           │                      │                      │
-           ▼                      ▼                      ▼
-┌──────────────────────┬──────────────────────┬──────────────────────┐
-│  API Gateway (L2)    │  API Gateway (L2)    │  API Gateway (L2)    │ ← Regional
-│  • Response cache    │  • Response cache    │  • Response cache    │   (25% hits)
-│  • Geographic route  │  • Geographic route  │  • Geographic route  │
-│  • Rate limiting     │  • Rate limiting     │  • Rate limiting     │
-│  • Load balancing    │  • Load balancing    │  • Load balancing    │◀──────────────────┐ ← Return ticket 
-└──────────┬───────────┴──────────┬───────────┴──────────┬───────────┘                   │   availability
-           │                      │                      │                               │   search request
-           ▼                      ▼                      ▼                               │   (If not implement L3)
-┌──────────────────────┬──────────────────────┬──────────────────────┐                   │
-│  Redis Cache (L3)    │  Redis Cache (L3)    │  Redis Cache (L3)    │ ← Regional        │
-│  • Events: 5min TTL  │  • Events: 5min TTL  │  • Events: 5min TTL  │   (10% hits)      │
-│  • Tickets: 10s TTL  │  • Tickets: 10s TTL  │  • Tickets: 10s TTL  │                   │
-│  • Session data      │  • Session data      │  • Session data      │                   │
-│  • Cluster: 3 nodes  │  • Cluster: 3 nodes  │  • Cluster: 3 nodes  │◀──────────────────┤ ← Update
-└──────────┬───────────┴──────────┬───────────┴──────────┬───────────┘                   │   (If implement L3)
-           │                      │                      │                               │
-           │                      │                      │                               │
-           ▼                      ▼                      ▼                               │
-    ┌───────────────────────────────────────────────────────────┐                        │
-    │              VIRTUAL WAITING QUEUE                        │ ← Traffic Control      │
-    │         (Throttle: 100K users → 500 concurrent)           │   (Hot Events)         │
-    │                                                           │                        │
-    │       Queue Position Updates via WebSocket/SSE            │                        │
-    │       • User sees: "Position #4,523 → #4,200..."          │                        │
-    │       • Batch admit: Every 100 bookings                   │                        │
-    │       • Fair FIFO access                                  │                        │
-    └──────┬──────────────────────┬──────────────────────┬──────┘                        │
-           │                      │                      │                               │
-           ▼                      ▼                      ▼                               │
-    ┌───────────────────────────────────────────────────────────┐                        │
-    │         BOOKING REQUESTS (After Queue Admission)          │                        │
-    │                                                           │                        │
-    │  Option A (Current): Direct to DB                         │ ← Synchronous          │
-    │  ├─ API handles request                                   │   (10K users)          │
-    │  └─ Direct DB transaction (100-300ms)                     │                        │
-    │                                                           │                        │
-    │  Option B (>100K): Message Queue + Workers                │ ← Asynchronous         │ 
-    │  ├─ API: Return requestId immediately (<10ms)             │   (100K+ users)        │ 
-    │  ├─ Push to BullMQ/RabbitMQ                               │                        │ 
-    │  ├─ Workers (50 per tier) process queue                   │                        │
-    │  └─ Notify user via WebSocket on completion               │                        │
-    └─┬──────────────────────────────────────────────┬──────────┘                        │
-      │             ▲                                │                                   │
-      │             │                                │                                   │        
-      │             ▼                                ▼                                   │
-      │  ┌──────────────────────┐     ┌──────────────────────────────────────────────────┴─────┐
-      │  │  Payment System API  │     │              REDIS DISTRIBUTED LOCK (L4)               │ ← Pre-filter
-      │  │     (e.g.Stripe)     │     │         (For >50K concurrent - Optional Layer)         │   (100K+ users)
-      │  │  • Get payment       │     │                                                        │
-      │  │    confirmation      │     │  • Fast path: Redis lock check (1-2ms)                 │
-      │  └──────────────────────┘     │  • SET ticket:123 userId EX 600 NX                     │          
-      │                               │  • Filter locked tickets from DB results               │
-      │                               │  • Auto-cleanup via TTL (10-min reservation window)    │
-      │                               └────────────────────────────────────────────────────────┘
-      ▼           
-┌─────────────────────────────────────────────────────────────────────┐
-│                   DATABASE LAYER (Source of Truth)                  │
-└─────────────────────────────────────────────────────────────────────┘
-              │                   │                   │
-    ┌─────────▼─────────┬─────────▼─────────┬─────────▼─────────┐
-    │  Primary DB (US)  │  Primary DB (EU)  │ Primary DB (ASIA) │ ← Event-based
-    │  Event-based shard│  Event-based shard│  Event-based shard│   Sharding
-    │                   │                   │                   │
-    │  • Row-level lock │  • Row-level lock │  • Row-level lock │
-    │  • FOR UPDATE     │  • FOR UPDATE     │  • FOR UPDATE     │
-    │  • SKIP LOCKED    │  • SKIP LOCKED    │  • SKIP LOCKED    │
-    │  • ACID txn       │  • ACID txn       │  • ACID txn       │
-    └─────────┬─────────┴─────────┬─────────┴─────────┬─────────┘
-              │                   │                   │
-    ┌─────────▼─────────┬─────────▼─────────┬─────────▼─────────┐
-    │ Read Replica (US) │ Read Replica (EU) │Read Replica (ASIA)│ ← Read Scaling
-    │ Async replication │ Async replication │ Async replication │   (1-5s lag)
-    └───────────────────┴───────────────────┴───────────────────┘
-         │                      │                      │
-         └──────────────────────┴──────────────────────┘
-                  Async Replication (Cross-Region)
-```
-
-**Data Flow Patterns:**
-
-```
-READ PATH (95% of traffic - Optimized for Speed):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-User (EU) → CDN (instant) → API Gateway → Redis Cache → Read Replica
-Latency: 50-100ms | Consistency: Eventual (acceptable)
-
-WRITE PATH (5% of traffic - Optimized for Correctness):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-User (Any) → Virtual Queue → [Redis Lock] → Primary DB → ACID Transaction
-Latency: 150-300ms | Consistency: Strong (required)
-```
-
-**Component Responsibilities:**
-
-| Layer | Cache Hit % | Purpose | Latency Reduction |
-|-------|-------------|---------|-------------------|
-| CDN (L1) | 60% | Static assets + common queries | 80% less origin load |
-| API Gateway (L2) | 25% | Regional routing + caching | Geographic optimization |
-| Redis Cache (L3) | 10% | Fast data access | 10x faster than DB |
-| Virtual Queue | N/A | Traffic smoothing (100K→500) | Prevent overload |
-| Redis Lock | N/A | Distributed coordination | 10x faster queries |
-| Message Queue | N/A | Async processing | Decouple API from DB |
-| Primary DB | 5% | Source of truth | ACID guarantees |
-| Read Replicas | N/A | Read scaling | Handle 95% of queries |
-
-Details for each optimization strategy discussed below.
-
----
-
 ### Achieving 99.99% Availability
 
 **Database:**
@@ -1560,6 +1431,133 @@ Tickets should be released back to available status.
 
 ## 🔮 Future Improvements
 
+### 🏗️ Target Architecture
+
+**Complete system architecture with all optimizations implemented for 1M DAU, 50K concurrent users:**
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                         GLOBAL USERS (1M DAU)                      │
+│         US Region            EU Region            ASIA Region      │
+│         (300K users)         (400K users)         (300K users)     │
+└──────────┬──────────────────────┬──────────────────────┬───────────┘
+           │                      │                      │
+           ▼                      ▼                      ▼
+┌─────────────────────┬─────────────────────┬────────────────────────┐
+│   CDN Layer (L1)    │   CDN Layer (L1)    │   CDN Layer (L1)       │ ← Edge Cache
+│  • Static assets    │  • Static assets    │  • Static assets       │   (60% hits)
+│  • API cache 1-5min │  • API cache 1-5min │  • API cache 1-5min    │
+└──────────┬──────────┴───────────┬─────────┴────────────┬───────────┘
+           │                      │                      │
+           ▼                      ▼                      ▼
+┌──────────────────────┬──────────────────────┬──────────────────────┐
+│  API Gateway (L2)    │  API Gateway (L2)    │  API Gateway (L2)    │ ← Regional
+│  • Response cache    │  • Response cache    │  • Response cache    │   (25% hits)
+│  • Geographic route  │  • Geographic route  │  • Geographic route  │
+│  • Rate limiting     │  • Rate limiting     │  • Rate limiting     │
+│  • Load balancing    │  • Load balancing    │  • Load balancing    │◀──────────────────┐ ← Return ticket 
+└──────────┬───────────┴──────────┬───────────┴──────────┬───────────┘                   │   availability
+           │                      │                      │                               │   search request
+           ▼                      ▼                      ▼                               │   (If not implement L3)
+┌──────────────────────┬──────────────────────┬──────────────────────┐                   │
+│  Redis Cache (L3)    │  Redis Cache (L3)    │  Redis Cache (L3)    │ ← Regional        │
+│  • Events: 5min TTL  │  • Events: 5min TTL  │  • Events: 5min TTL  │   (10% hits)      │
+│  • Tickets: 10s TTL  │  • Tickets: 10s TTL  │  • Tickets: 10s TTL  │                   │
+│  • Session data      │  • Session data      │  • Session data      │                   │
+│  • Cluster: 3 nodes  │  • Cluster: 3 nodes  │  • Cluster: 3 nodes  │◀──────────────────┤ ← Update
+└──────────┬───────────┴──────────┬───────────┴──────────┬───────────┘                   │   (If implement L3)
+           │                      │                      │                               │
+           │                      │                      │                               │
+           ▼                      ▼                      ▼                               │
+    ┌───────────────────────────────────────────────────────────┐                        │
+    │              VIRTUAL WAITING QUEUE                        │ ← Traffic Control      │
+    │         (Throttle: 100K users → 500 concurrent)           │   (Hot Events)         │
+    │                                                           │                        │
+    │       Queue Position Updates via WebSocket/SSE            │                        │
+    │       • User sees: "Position #4,523 → #4,200..."          │                        │
+    │       • Batch admit: Every 100 bookings                   │                        │
+    │       • Fair FIFO access                                  │                        │
+    └──────┬──────────────────────┬──────────────────────┬──────┘                        │
+           │                      │                      │                               │
+           ▼                      ▼                      ▼                               │
+    ┌───────────────────────────────────────────────────────────┐                        │
+    │         BOOKING REQUESTS (After Queue Admission)          │                        │
+    │                                                           │                        │
+    │  Option A (Current): Direct to DB                         │ ← Synchronous          │
+    │  ├─ API handles request                                   │   (10K users)          │
+    │  └─ Direct DB transaction (100-300ms)                     │                        │
+    │                                                           │                        │
+    │  Option B (>100K): Message Queue + Workers                │ ← Asynchronous         │ 
+    │  ├─ API: Return requestId immediately (<10ms)             │   (100K+ users)        │ 
+    │  ├─ Push to BullMQ/RabbitMQ                               │                        │ 
+    │  ├─ Workers (50 per tier) process queue                   │                        │
+    │  └─ Notify user via WebSocket on completion               │                        │
+    └─┬──────────────────────────────────────────────┬──────────┘                        │
+      │             ▲                                │                                   │
+      │             │                                │                                   │        
+      │             ▼                                ▼                                   │
+      │  ┌──────────────────────┐     ┌──────────────────────────────────────────────────┴─────┐
+      │  │  Payment System API  │     │              REDIS DISTRIBUTED LOCK (L4)               │ ← Pre-filter
+      │  │     (e.g.Stripe)     │     │         (For >50K concurrent - Optional Layer)         │   (100K+ users)
+      │  │  • Get payment       │     │                                                        │
+      │  │    confirmation      │     │  • Fast path: Redis lock check (1-2ms)                 │
+      │  └──────────────────────┘     │  • SET ticket:123 userId EX 600 NX                     │          
+      │                               │  • Filter locked tickets from DB results               │
+      │                               │  • Auto-cleanup via TTL (10-min reservation window)    │
+      │                               └────────────────────────────────────────────────────────┘
+      ▼           
+┌─────────────────────────────────────────────────────────────────────┐
+│                   DATABASE LAYER (Source of Truth)                  │
+└─────────────────────────────────────────────────────────────────────┘
+              │                   │                   │
+    ┌─────────▼─────────┬─────────▼─────────┬─────────▼─────────┐
+    │  Primary DB (US)  │  Primary DB (EU)  │ Primary DB (ASIA) │ ← Event-based
+    │  Event-based shard│  Event-based shard│  Event-based shard│   Sharding
+    │                   │                   │                   │
+    │  • Row-level lock │  • Row-level lock │  • Row-level lock │
+    │  • FOR UPDATE     │  • FOR UPDATE     │  • FOR UPDATE     │
+    │  • SKIP LOCKED    │  • SKIP LOCKED    │  • SKIP LOCKED    │
+    │  • ACID txn       │  • ACID txn       │  • ACID txn       │
+    └─────────┬─────────┴─────────┬─────────┴─────────┬─────────┘
+              │                   │                   │
+    ┌─────────▼─────────┬─────────▼─────────┬─────────▼─────────┐
+    │ Read Replica (US) │ Read Replica (EU) │Read Replica (ASIA)│ ← Read Scaling
+    │ Async replication │ Async replication │ Async replication │   (1-5s lag)
+    └───────────────────┴───────────────────┴───────────────────┘
+         │                      │                      │
+         └──────────────────────┴──────────────────────┘
+                  Async Replication (Cross-Region)
+```
+
+**Data Flow Patterns:**
+
+```
+READ PATH (95% of traffic - Optimized for Speed):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+User (EU) → CDN (instant) → API Gateway → Redis Cache → Read Replica
+Latency: 50-100ms | Consistency: Eventual (acceptable)
+
+WRITE PATH (5% of traffic - Optimized for Correctness):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+User (Any) → Virtual Queue → [Redis Lock] → Primary DB → ACID Transaction
+Latency: 150-300ms | Consistency: Strong (required)
+```
+
+**Component Responsibilities:**
+
+| Layer | Cache Hit % | Purpose | Latency Reduction |
+|-------|-------------|---------|-------------------|
+| CDN (L1) | 60% | Static assets + common queries | 80% less origin load |
+| API Gateway (L2) | 25% | Regional routing + caching | Geographic optimization |
+| Redis Cache (L3) | 10% | Fast data access | 10x faster than DB |
+| Virtual Queue | N/A | Traffic smoothing (100K→500) | Prevent overload |
+| Redis Lock | N/A | Distributed coordination | 10x faster queries |
+| Message Queue | N/A | Async processing | Decouple API from DB |
+| Primary DB | 5% | Source of truth | ACID guarantees |
+| Read Replicas | N/A | Read scaling | Handle 95% of queries |
+
+---
+
 ### Scaling to 1M DAU / 100K+ Concurrent Users
 
 1. **Hybrid Architecture for Extreme Scale**
@@ -1636,6 +1634,56 @@ Tickets should be released back to available status.
    - Kubernetes deployment with auto-scaling
    - Infrastructure as Code (Terraform)
    - Blue-green deployments for zero-downtime
+
+
+### AWS Deployment Mapping
+
+**Mapping logical components to AWS services for production deployment:**
+
+| Component | AWS Service | Configuration | Purpose |
+|-----------|-------------|---------------|---------|
+| **CDN (L1)** | CloudFront | • Global edge locations<br>• Origin: ALB<br>• Cache behaviors by path | Static assets + API caching |
+| **API Gateway (L2)** | Application Load Balancer (ALB) | • Regional endpoints (US/EU/ASIA)<br>• AWS WAF for DDoS protection<br>• SSL termination | Regional routing + security |
+| **Load Balancer** | Application Load Balancer (ALB) | • Cross-AZ distribution<br>• Health checks (/health)<br>• Target groups for API servers | Distribute traffic, auto-scaling |
+| **API Servers** | ECS Fargate / EKS | • Auto-scaling (2-10 tasks/region)<br>• Multi-AZ deployment<br>• Task definition: 2 vCPU, 4GB RAM | Node.js/Express backend |
+| **Redis Cache (L3)** | ElastiCache for Redis | • Cluster mode enabled<br>• 3+ nodes per region<br>• Multi-AZ with auto-failover<br>• cache.r6g.large | Regional caching layer |
+| **Redis Lock (L4)** | ElastiCache for Redis | • Separate cluster (critical)<br>• AOF + RDB persistence<br>• Cross-region replication | Distributed ticket locks |
+| **Virtual Queue** | ElastiCache for Redis | • Sorted sets for queue<br>• Pub/Sub for notifications<br>• Same cluster as L3 or separate | Queue management + position tracking |
+| **Message Queue** | Amazon SQS / Amazon MQ | • FIFO queues per tier<br>• Dead-letter queue<br>• Message retention: 14 days | Async booking processing |
+| **Workers** | ECS Fargate / Lambda | • Auto-scaling (1-50 workers)<br>• SQS event source<br>• Concurrency per tier control | Process booking requests |
+| **Primary Database** | RDS for PostgreSQL | • Multi-AZ deployment<br>• db.r6g.2xlarge (8 vCPU, 64GB)<br>• Provisioned IOPS (3000)<br>• Automated backups (7-day retention) | Event-sharded databases |
+| **Read Replicas** | RDS Read Replicas | • 2-3 replicas per region<br>• Async replication<br>• Promote to primary on failure | Scale read queries (95% traffic) |
+| **WebSocket Server** | ECS + ALB + Redis | • Socket.IO with Redis adapter<br>• Sticky sessions (ALB)<br>• Redis pub/sub for multi-instance | Real-time updates (SSE/WebSocket) |
+| **DNS** | Route53 | • GeoDNS routing policies<br>• Health checks per region<br>• Failover to healthy regions | Global user routing |
+| **Monitoring** | CloudWatch + X-Ray | • Custom metrics dashboards<br>• Distributed tracing<br>• Log aggregation (CloudWatch Logs) | Performance monitoring |
+| **Alerting** | CloudWatch Alarms + SNS | • Alarm for each SLA metric<br>• SNS topics for notifications<br>• Lambda for custom checks | Incident detection + response |
+| **Secrets** | AWS Secrets Manager | • DB credentials rotation<br>• JWT signing keys<br>• Redis passwords | Secure credential management |
+---
+
+**Infrastructure as Code (Terraform):**
+
+```hcl
+# Recommended structure
+terraform/
+├─ modules/
+│  ├─ networking/          # VPC, subnets, security groups
+│  ├─ database/            # RDS primary + replicas
+│  ├─ cache/               # ElastiCache clusters (Redis)
+│  ├─ compute/             # ECS/Fargate for API servers
+│  ├─ cdn/                 # CloudFront distribution
+│  ├─ dns/                 # Route53 hosted zone + records
+│  ├─ monitoring/          # CloudWatch dashboards + alarms
+│  └─ queue/               # SQS queues + workers (optional)
+├─ environments/
+│  ├─ dev.tfvars           # Development configuration
+│  ├─ staging.tfvars       # Staging configuration
+│  └─ prod.tfvars          # Production configuration
+└─ main.tf                 # Root module
+
+# Deploy to all regions
+terraform workspace select prod
+terraform apply -var-file=environments/prod.tfvars
+```
 
 ## 📝 Project Structure
 
