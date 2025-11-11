@@ -152,47 +152,433 @@ The frontend should now be running on `http://localhost:3000`
 3. Click "Create Tickets"
 4. Tickets will be added to the inventory
 
-## 🔐 Preventing Double-Booking
+## 🔐 Preventing Double-Booking Under Race Conditions
 
-This system implements multiple layers of protection against double-booking:
+### Current Implementation: Database Pessimistic Locking
 
-### 1. Row-Level Locking with SKIP LOCKED
+**Approach:** Use PostgreSQL's row-level locking with `FOR UPDATE SKIP LOCKED`
+
+#### 1. Atomic Ticket Selection with Row Lock
+
 ```typescript
-// PostgreSQL row-level locking prevents concurrent access to same ticket
-SELECT id FROM tickets 
-WHERE event_id = $1 AND tier = $2 AND status = 'available'
-ORDER BY id
-LIMIT 1
-FOR UPDATE SKIP LOCKED
+// Critical Query - The heart of double-booking prevention
+UPDATE tickets 
+SET status = 'pending', user_id = $1, updated_at = CURRENT_TIMESTAMP
+WHERE id = (
+  SELECT id FROM tickets 
+  WHERE event_id = $2 AND tier = $3 AND status = 'available'
+  ORDER BY id
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED  ← CRITICAL: Exclusive lock + skip if locked
+)
+RETURNING *
 ```
 
-**How it works:**
-- `FOR UPDATE` locks the selected row
-- `SKIP LOCKED` skips tickets that are already locked by other transactions
-- This ensures concurrent requests get different tickets
+**How it prevents race conditions:**
 
-### 2. Database Transactions
-```typescript
-await client.query('BEGIN');
-// ... reserve tickets ...
-await client.query('COMMIT'); // or ROLLBACK on error
+```
+Concurrent Request Timeline with Locking:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+T0 (0ms):  1 ticket available (#1000)
+
+T1 (1ms):  User A: BEGIN transaction
+           SELECT ... FOR UPDATE SKIP LOCKED
+           → Acquires EXCLUSIVE LOCK on ticket #1000
+           → Returns ticket #1000 to User A
+
+T1 (1ms):  User B: BEGIN transaction (simultaneous)
+           SELECT ... FOR UPDATE SKIP LOCKED
+           → Tries to lock ticket #1000
+           → Ticket already locked by User A
+           → SKIP LOCKED: Moves to next available
+           → No available tickets left
+           → Returns NULL (no ticket)
+
+T2 (5ms):  User A: UPDATE ticket #1000 → success
+           COMMIT
+
+T3 (6ms):  User B: Gets error "No tickets available"
+
+Result: NO DOUBLE BOOKING - Only User A got the ticket
 ```
 
-**Benefits:**
-- Atomicity: All operations succeed or none do
-- Isolation: Changes are invisible to other transactions until commit
-- Consistency: Database constraints are maintained
+**Key Mechanisms:**
 
-### 3. Event-Level Locking
+1. **`FOR UPDATE`**: Acquires exclusive row-level lock
+   - Only the transaction holding the lock can modify the row
+   - Other transactions must wait or skip (with SKIP LOCKED)
+
+2. **`SKIP LOCKED`**: Non-blocking behavior
+   - If row is locked, skip it and look for next available
+   - Prevents deadlocks and lock wait timeouts
+   - Each concurrent request gets a different ticket
+
+3. **Transaction Isolation**: ACID guarantees
+   - Changes invisible to other transactions until COMMIT
+   - All-or-nothing atomicity
+   - Database ensures consistency
+
+#### 2. Transaction Wrapper
+
 ```typescript
-// Lock event row to prevent race conditions on available count updates
+// All booking operations wrapped in transaction
+const client = await pool.connect();
+try {
+  await client.query('BEGIN');
+  
+  // Reserve tickets (with row-level locks)
+  const tickets = await reserveMultipleTickets(client, ...);
+  
+  // Update event counts (with event-level lock)
+  await updateEventCapacity(client, ...);
+  
+  await client.query('COMMIT');
+} catch (error) {
+  await client.query('ROLLBACK');  // All changes reverted
+  throw error;
+} finally {
+  client.release();
+}
+```
+
+#### 3. Event-Level Locking (Prevent Overselling)
+
+```typescript
+// Lock event row to prevent race conditions on count updates
 SELECT * FROM events WHERE id = $1 FOR UPDATE
 ```
 
-### 4. Two-Step Booking Process
-- **Step 1 (Reserve)**: Tickets status → `pending`, unavailable to others
-- **Step 2 (Confirm)**: After payment, tickets status → `booked`
-- If payment fails, tickets are released back to `available`
+This prevents overselling at the event level by ensuring sequential updates to available counts.
+
+#### 4. Three-State Ticket Status
+
+```
+available → pending → booked
+              ↓ (payment fails)
+           available (released)
+```
+
+- `available`: Can be booked
+- `pending`: Reserved during payment (10-min window)
+- `booked`: Payment confirmed, permanently assigned
+
+### Scale Analysis: Meeting Requirements (1M DAU, 50K Concurrent)
+
+**Current Implementation Capacity:**
+
+```
+Database: PostgreSQL with 20 connection pool
+Throughput: ~200-400 bookings/second
+Max Concurrent: ~10,000 users (if works with Virtual Queue throttling to 500)
+Region: Single-region deployment
+
+Sufficient for:
+- Moderate traffic events (<10K concurrent users)
+- Single-region user base
+- Demonstration of concurrency control principles
+```
+
+**Why Current Approach Doesn't Scale to 50K Concurrent as Required Scale:**
+
+| Bottleneck | Current Limit | At 50K Concurrent | Impact |
+|------------|---------------|-------------------|--------|
+| **DB Connections** | 20 pool size | 2,500 requests/connection | Massive queue, timeouts ❌ |
+| **Throughput** | 400 bookings/sec | Need 5,000+ bookings/sec | Cannot handle peak load ❌ |
+| **Single DB** | All writes to one DB | Serialization bottleneck | Cannot scale horizontally ❌ |
+| **Cross-Region** | Same-region only | 150-300ms latency | Poor global UX ❌ |
+
+**How to Achieve Required Scale:**
+
+The alternative approaches evaluated below address these bottlenecks:
+
+1. **Redis Lock Layer** → Solves query performance + reduces DB load
+   - 10x faster queries (1ms vs 10ms)
+   - Handles 100K+ concurrent queries
+   - See "Option 1" below for details
+
+2. **Multi-Region Deployment** → Solves cross-region latency
+   - Regional read replicas
+   - Event-based sharding
+   - See "Global Users Architecture" section
+
+3. **Message Queue + Workers** → Solves connection exhaustion
+   - Decouple API from DB
+   - Controlled worker concurrency
+   - See "Option 2" below for details
+
+4. **Virtual Waiting Queue** → Smooth traffic spikes
+   - Already implemented
+   - Throttles 50K → 500 concurrent
+   - See "Scalability Considerations" section
+
+### Alternative Approaches Evaluated
+
+For scaling beyond current limitations, we evaluated two alternative architectures:
+
+#### Option 1: Redis-Based Distributed Lock (Pre-Filter Layer)
+
+**Concept:** Use Redis as a fast distributed lock layer before hitting the database.
+
+**Architecture:**
+
+```
+User Request → Redis Lock Check → DB Confirmation
+               (1-2ms)            (10-50ms)
+               
+Query Flow:
+1. DB: SELECT * WHERE status='available' → [1,2,3,4,5]
+2. Redis: Get locked tickets → [2,4]
+3. Filter: [1,2,3,4,5] - [2,4] = [1,3,5]
+4. Return: [1,3,5] to user
+
+Reserve Flow:
+1. User reserves ticket #3
+2. Redis: SET ticket:3 true EX 600 (10min TTL)
+3. Other users won't see ticket #3 (filtered out)
+4. On confirm: DB UPDATE + Redis DEL
+5. On timeout: Redis TTL expires (auto-release)
+```
+
+**Implementation:**
+
+See sample implementation deails in ticketRepo.
+
+**Advantages:**
+- **10x faster queries**: Redis lookup ~1ms vs DB ~10ms
+- **Automatic cleanup**: TTL handles timeouts (no background job)
+- **Lower DB load**: ~50% fewer writes  
+  > _Note: This benefit does **not** exist if a DB recovery mechanism is implemented (since all locks must be mirrored to the DB, causing equivalent write load)._
+- **Cross-region friendly**: Redis can be replicated globally
+- **Higher throughput**: Can handle 100K+ concurrent queries
+
+**Trade-off Analysis:**
+
+| Aspect | Current (DB Only) | Redis Lock Layer |
+|--------|------------------|------------------|
+| **Query Latency** | 10-50ms | 1-5ms  |
+| **Write Latency** | 10-50ms | 1-5ms (Redis) + async DB |
+| **Throughput** | 400/sec | 10,000+/sec  |
+| **Consistency** | Strong (ACID)  | Eventual (needs sync)  |
+| **Failure Mode** | DB rollback  | Redis data loss (Covered by DB backup) |
+| **Complexity** | Low (single system)  | High (two systems)  |
+| **Ops Burden** | DB only | DB + Redis Cluster |
+
+#### Option 2: Message Queue + Asynchronous Workers
+
+**Concept:** Decouple API from database processing using message queue and worker pool.
+
+**Architecture:**
+
+```
+User Request → API (immediate response) → Message Queue → Workers → DB
+               (< 10ms)                    (buffering)    (batch)   (persist)
+
+Flow:
+1. User clicks "Book" (or payment system confirms)
+2. API: Generate booking request ID (or simply use ticketId), return immediately
+   Response: { requestId: "abc123", status: "processing" }
+3. Push request to queue (Redis/RabbitMQ)
+4. Worker pool (10-50 workers) processes queue
+5. Worker: Execute DB transaction with locking
+6. Update booking status in cache
+7. Notify user via WebSocket/polling
+```
+
+**Sample Implementation:**
+
+```typescript
+// API Layer - Immediate return
+async function requestBooking(
+  eventId: string,
+  ticketId: string,
+  tier: string,
+  userId: string,
+  quantity: number
+) {
+  const requestId = uuidv4(); // Or directly use ticketId
+  
+  // Store request in Redis (for status polling)
+  await redis.setex(
+    `booking:${requestId}`,
+    300, // 5 min TTL
+    JSON.stringify({
+      eventId,
+      tier,
+      userId,
+      quantity,
+      status: 'pending',
+      createdAt: Date.now()
+    })
+  );
+  
+  // Push to processing queue
+  await queue.add('process-booking', {
+    requestId,
+    eventId,
+    tier,
+    userId,
+    quantity
+  });
+  
+  return {
+    requestId,
+    status: 'pending',
+    message: 'Your booking is being processed'
+  };
+}
+
+// Worker - Controlled concurrency
+async function processBookingWorker(job) {
+  const { requestId, eventId, tier, userId, quantity } = job.data;
+  
+  try {
+    // Now use DB locking - but with controlled concurrency
+    const booking = await bookTicketsWithLock(
+      eventId,
+      tier,
+      userId,
+      quantity
+    );
+    
+    // Update status to confirmed
+    await redis.setex(
+      `booking:${requestId}`,
+      3600,
+      JSON.stringify({
+        status: 'confirmed',
+        bookingId: booking.id,
+        tickets: booking.tickets
+      })
+    );
+    
+    // Notify user (WebSocket/email)
+    await notifyUser(userId, 'booking_confirmed', booking);
+    
+  } catch (error) {
+    // Update status to failed
+    await redis.setex(
+      `booking:${requestId}`,
+      3600,
+      JSON.stringify({
+        status: 'failed',
+        error: error.message
+      })
+    );
+    
+    await notifyUser(userId, 'booking_failed', { error });
+  }
+}
+
+// Status Polling Endpoint
+app.get('/booking/:requestId/status', async (req, res) => {
+  const status = await redis.get(`booking:${req.params.requestId}`);
+  res.json(JSON.parse(status));
+});
+```
+
+**Advantages:**
+- ✅ **Fast API responses**: <10ms (no DB wait)
+- ✅ **Controlled concurrency**: Limit workers per tier (e.g., 50)
+- ✅ **Better resilience**: Queue buffers traffic spikes
+- ✅ **Retry logic**: Failed bookings can retry
+- ✅ **Horizontal scaling**: Add more workers easily
+- ✅ **Decoupled**: API failures don't affect booking processing
+
+**Challenges:**
+- ⚠️ **Async UX**: Users don't get immediate confirmation
+  - Need status polling or WebSocket
+  - More complex frontend
+- ⚠️ **Additional infrastructure**: Message queue (Redis/RabbitMQ)
+  - More operational complexity
+  - More failure modes
+- ⚠️ **Ordering issues**: May process out of order
+  - Need careful queue prioritization
+- ⚠️ **Duplicate requests**: User retries while processing
+  - Need idempotency keys
+
+**User Experience Comparison:**
+
+```
+Synchronous (Current):
+User clicks "Book" → Wait 200ms → "Confirmed!" or "Failed"
+✅ Immediate feedback
+✅ Simple UX
+❌ User waits during processing
+
+Asynchronous (Queue):
+User clicks "Book" → <10ms → "Processing... (Position #42)"
+→ Wait notification → "Confirmed!"
+✅ Fast initial response
+✅ Better for slow operations
+❌ More complex UX
+❌ Need status updates
+```
+
+### Comparison: All Approaches
+
+| Aspect | Current (DB Lock) | Redis Lock | Message Queue |
+|--------|------------------|------------|---------------|
+| **Max Concurrent** | 10K  | 100K  | 500K+  |
+| **Query Latency** | 10-50ms | 1-5ms  | 1-5ms (API)  |
+| **Booking Latency** | 100-300ms  | 50-150ms  | <10ms (async) ⚠️ |
+| **Consistency** | Strong ✅ | Eventual ⚠️ | Eventual ⚠️ |
+| **Implementation** | Simple  | Medium  | Complex  |
+| **Ops Complexity** | Low  | Medium  | High  |
+| **Infrastructure** | DB only  | DB + Redis | DB + Redis + Queue |
+| **Failure Modes** | Few  | Multiple ⚠️ | Many ❌ |
+
+
+### Proof of Correctness (Current Implementation)
+
+**Invariant:** Each ticket can only be booked by one user.
+
+**Proof by Database Guarantees:**
+
+1. **Row-level lock is exclusive**
+   - PostgreSQL guarantees only one transaction holds FOR UPDATE lock
+   - Other transactions either wait or skip (SKIP LOCKED)
+
+2. **Transaction isolation**
+   - READ COMMITTED ensures no dirty reads
+   - Changes invisible until COMMIT
+
+3. **Atomic SELECT-UPDATE**
+   - Subquery with FOR UPDATE makes selection atomic
+   - UPDATE happens in same transaction
+   - No gap between select and update
+
+4. **SKIP LOCKED ensures uniqueness**
+   - Concurrent requests skip locked rows
+   - Each request gets different ticket
+   - No two transactions can modify same ticket simultaneously
+
+**Therefore:** No double-booking is possible. ∎
+
+### Testing & Verification
+
+See code implementation with detailed comments in:
+- `backend/src/repositories/ticket.repository.ts` → `reserveTicket()`
+- `backend/src/services/booking.service.ts` → `reserveTickets()`
+
+**Load Testing:**
+```bash
+# Simulate 1000 concurrent bookings for 100 tickets
+for i in {1..1000}; do
+  curl -X POST http://localhost:3001/api/v1/booking/reserve \
+    -H "Content-Type: application/json" \
+    -d '{"userId":'$i',"tickets":[{"tier":"VIP","quantity":1}]}' &
+done
+wait
+
+# Verify: Exactly 100 bookings, 0 duplicates
+psql -d ticketbooking_db -c "
+  SELECT COUNT(DISTINCT user_id) as unique_users,
+         COUNT(*) as total_bookings
+  FROM tickets 
+  WHERE status IN ('pending', 'booked');
+"
+# Expected: unique_users = total_bookings = 100
+```
 
 ## 🌐 API Endpoints
 
@@ -366,17 +752,19 @@ Example: 1234567890123456789
 
 **When to Migrate:**
 
-- ✅ **Now (for learning)**: Demonstrates distributed system design thinking
 - ✅ **Before multi-region deployment**: Essential for global scale
 - ✅ **When sharding database**: Enables partition-friendly IDs
+- See "Design Decisions #5" for more details of migration timing 
 
 ### 4. Row-Level Locking vs. Optimistic Locking
 **Decision:** Pessimistic locking with `FOR UPDATE SKIP LOCKED`.
+
 **Rationale:**
 - ✅ Guarantees no double-booking
 - ✅ Better for high-contention scenarios (tickets)
 - ✅ No retry logic needed
 - ❌ Slightly lower throughput than optimistic locking
+
 **Alternative:** Optimistic locking with version numbers would require retry logic.
 
 ### 5. Global Users Architecture (Multi-Region Deployment)
@@ -419,8 +807,8 @@ User (any region) → CDN (edge location) → Regional Redis Cache → Primary D
 
 **Why Stale Data is Acceptable:**
 - User sees "100 tickets available" (actually 95 available)
-- When user clicks "Book", system checks real-time availability at write time. (We will discuss the real-time ticket seat availability scenareo in the "Scalability Considerations" chapter.)
-- If sold out, booking fails gracefully with clear error message
+- When user clicks "Book", system checks real-time availability at write time. (We will discuss the real-time ticket seat availability scenario in the "Scalability Considerations" chapter.)
+- If sold out, booking fails gracefully with clear error messages
 - Trade-off: Slightly outdated info for much lower latency (50ms vs 300ms)
 
 **Geographic DNS Routing:**
@@ -564,25 +952,179 @@ User (any region) → Geographic Router → Event's Primary DB Region
 - Capacity: ~1,500 bookings/second = sufficient for peak load
 
 **Optimizations for Scale:**
+
 1. **Database Optimization**
    - Add indexes on `(event_id, tier, status)` (already implemented)
    - Partition tickets table by event_id
-   - Use read replicas for GET requests
+   - Use read replicas for GET requests in each region
+   - Connection pooling to manage database connections efficiently
 
-2. **Caching Layer**
-   - Redis cache for available ticket counts
-   - Cache invalidation on booking
-   - Reduces database load by 70%+
+2. **Multi-Layer Caching Strategy**
+   
+   Implement three-tier caching to minimize latency and reduce database load:
+   
+   **Layer 1: CDN (CloudFlare/CloudFront)**
+   - Frontend static assets (HTML, JS, CSS) - cached at edge locations
+   - Event listing API responses (TTL: 1-5 minutes)
+   - Ticket availability counts (TTL: 30 seconds)
+   - Serves content from location closest to user
+
+   **Layer 2: Regional API Gateway**
+   - API response caching for frequently accessed endpoints
+   - Request routing based on user geography
+   - Rate limiting per region (prevents regional abuse)
+   - Load balancing across backend instances
+   - Health checks and automatic failover
+
+   **Layer 3: Regional Redis Cache**
+   - Event details (TTL: 5 minutes) - rarely changes
+   - Available ticket counts (TTL: 10 seconds) - frequently updated
+   - User session data (TTL: session duration)
+   - Cache invalidation on booking completion
+   - Pub/Sub for cross-instance cache coordination
+
+   **Cache Hit Ratio Estimation:**
+   - Layer 1 (CDN): ~60% of requests (static content + common queries)
+   - Layer 2 (API Gateway): ~25% of requests (regional patterns)
+   - Layer 3 (Redis): ~10% of requests (cache misses from L1/L2)
+   - Database: ~5% of requests (cache misses + writes)
+
+   **Result:** 95% reduction in database read load, dramatically improved response times globally. [Reference](https://blog.paessler.com/cdn-performance-metrics)
 
 3. **Rate Limiting**
    - Per-IP rate limiting (express-rate-limit)
+   - Per-user rate limiting (prevent account abuse)
+   - Regional rate limits (protect regional infrastructure)
    - Prevents DDoS and bot abuse
    - Fair access for all users
 
-4. **Queue System** (for extreme scale)
-   - Redis/RabbitMQ queue for booking requests
-   - Worker pool processes bookings
-   - Better handling of traffic spikes
+4. **Queue System** (for hot events, extreme scale)
+   
+   **Approach:** User-facing queue with real-time position updates
+   - Queue management for high-demand events (100K+ concurrent users)
+   - Throttle concurrent bookings (e.g., 500 simultaneous transactions)
+   - Batch processing: Admit users in groups (e.g. every 100 bookings)
+   - Prevents database overload while maintaining fair FIFO access
+   - WebSocket provides real-time queue position updates to users
+   
+   **Why Virtual Queue over Redis/RabbitMQ Message Queue:**
+   
+   | Aspect | Virtual Waiting Queue | Redis/RabbitMQ Queue |
+   |--------|----------------------|---------------------|
+   | **User Visibility** | ✅ Real-time position updates | ❌ Black box (no visibility) |
+   | **User Experience** | ✅ Transparent wait time | ❌ "Processing..." indefinitely |
+   | **Fairness** | ✅ FIFO with visible position | ⚠️ FIFO but hidden from user |
+   | **Timeout Handling** | ✅ Users aware of wait time | ❌ Silent failures/timeouts |
+   | **Abandonment** | ✅ Users can leave queue | ⚠️ Jobs stuck in queue |
+   | **Implementation** | ⚠️ Requires WebSocket | ✅ Standard message queue |
+   | **Use Case** | User-facing bookings | Background jobs/processing |
+   
+   **Key Benefits:**
+   - **Transparency**: Users see their position and estimated wait time
+   - **Better UX**: "Position #4,523 → #4,200..." vs. loading spinner
+   - **Reduced Abandonment**: Users more likely to wait when they see progress
+   - **No Retry Spam**: Users don't refresh frantically when they see queue movement
+   - **Fair Perception**: Visible FIFO order builds trust
+   
+   See "Global Users Architecture" section for detailed queue strategy and WebSocket implementation
+
+5. **Redis-Based Ticket Lock** (for >50K concurrent users)
+
+   **Implementation Strategy:**
+   
+   Use Redis as a pre-filter layer to reduce database load:
+   
+   ```
+   Reserve Flow:
+   1. Redis: SET ticket:123 userId EX 600  (10min TTL, lock acquired)
+   2. Return success to user (1-2ms latency)
+   3. DB remains: status='available' (Redis is source of truth for lock)
+   
+   Query Flow:
+   1. DB: Get all available tickets → [1,2,3,4,5]
+   2. Redis: Get locked tickets → [2,4]
+   3. Filter: Return [1,3,5] (excluding Redis-locked tickets)
+   
+   Confirm Flow:
+   1. DB: UPDATE tickets SET status='booked' WHERE id=123
+   2. Redis: DEL ticket:123 (release lock)
+   
+   Timeout Flow:
+   - Redis TTL expires after 10min (auto-release)
+   - No DB cleanup needed
+   - Next query shows ticket as available again
+   ```
+   
+   **Key Design Points:**
+   - DB only has 2 states: `available` and `booked` (no `pending`)
+   - Redis holds temporary reservation state (10-min TTL)
+   - Automatic cleanup via TTL (no background jobs)
+   - Filtering happens at query time (DB results - Redis locks)
+   
+   **Benefits:**
+   - 10x faster queries (Redis ~1ms vs DB ~10ms)
+   - Automatic timeout handling (TTL-based)
+   - 50% fewer DB writes (reserve is Redis-only)
+   - Better multi-region coordination
+   - Higher query throughput (100K+ queries/sec)
+   
+   **Challenges:**
+   - Consistency: Redis and DB state can diverge
+   - Redis becomes critical dependency (requires HA setup)
+   - Recovery logic needed on Redis failure
+   - Race condition in query+filter step (mitigate with Lua scripts)
+   
+   **Trade-off:** Adds operational complexity but essential for >50K concurrent users. See "Preventing Double-Booking → Alternative Approaches" for detailed analysis.
+
+6. **Message Queue + Worker Pool** (for >100K concurrent users)
+   
+   **Architecture:**
+   
+   ```
+   API Layer (Fast Response):
+   - Generate booking requestId
+   - Push to queue (BullMQ/RabbitMQ)
+   - Return: { requestId, status: 'processing' } in <10ms
+   
+   Worker Pool (Controlled Processing):
+   - 10-50 workers per event tier
+   - Pull from queue with controlled concurrency
+   - Execute DB transaction with locking
+   - Update status (Redis + notify user)
+   ```
+   
+   **Benefits:**
+   - Extreme scalability (500K+ concurrent API requests)
+   - API decoupled from DB (better fault tolerance)
+   - Built-in retry logic for failures
+   - Priority queuing (VIP users first)
+   - Batch processing optimizations
+   
+   **Challenges:**
+   - Async UX (users wait for notification, not immediate)
+   - More infrastructure (queue + workers)
+   - Complex idempotency handling
+   - Status tracking complexity
+   
+   **Why Not Implemented:**
+   
+   Virtual Waiting Queue provides similar benefits:
+   - Throttling (100K users → 500 concurrent bookings)
+   - Fairness (FIFO order)
+   - User transparency (visible queue position)
+   
+   But with **synchronous UX** that users expect for ticket booking:
+   - Immediate confirmation/rejection
+   - No status polling needed
+   - Simpler frontend implementation
+   
+   **Trade-off:** Message Queue changes fundamental UX from synchronous to asynchronous. For ticket booking, users expect immediate feedback. Better suited for background tasks (payment webhooks, email notifications, analytics).
+   
+   **When to Reconsider:**
+   - Booking workflow becomes very complex (multi-step verification)
+   - Need >100K concurrent bookings (Virtual Queue insufficient)
+   - Want sophisticated retry logic for payment providers
+   - Async UX becomes acceptable/preferred
 
 ### Performance: p95 < 500ms
 
@@ -627,39 +1169,82 @@ Tickets should be released back to available status.
 
 ## 🔮 Future Improvements
 
-1. **Authentication & Authorization**
+### Scaling to 1M DAU / 100K+ Concurrent Users
+
+1. **Hybrid Architecture for Extreme Scale**
+   
+   **Phase 1: Add Redis Lock Layer** (10K → 50K concurrent)
+   - Implement Redis-based distributed ticket locks
+   - Pre-filter available tickets at query time
+   - Reduce database query load by 90%
+   - Automatic TTL-based timeout handling
+   - See "Preventing Double-Booking → Option 1" for implementation
+   
+   **Phase 2: Multi-Region Deployment** (Global scale)
+   - Deploy across US, EU, ASIA regions
+   - Regional read replicas for low-latency queries
+   - Event-based sharding with primary regions
+   - Globally unique ticket IDs (Snowflake pattern)
+   - See "Global Users Architecture" for strategy
+   
+   **Phase 3: Message Queue for Resilience** (>100K concurrent)
+   - BullMQ/RabbitMQ for async booking processing
+   - Worker pool with controlled concurrency
+   - Retry logic for transient failures
+   - Decouple API from database availability
+   - See "Scalability Considerations → Message Queue" for details
+   
+   **Phase 4: Real-time Updates** (Enhanced UX)
+   - WebSocket connections for live seat maps
+   - Real-time ticket availability updates
+   - Queue position notifications
+   - Broadcast booking events to all connected clients by SSE/WebSocket
+   
+   **Target Metrics:**
+   - Support 1M DAU with 50K+ peak concurrent users
+   - p95 latency <100ms for queries, <300ms for bookings
+   - 99.99% availability with multi-region failover
+   - Zero double-bookings under all scenarios
+
+2. **Authentication & Authorization**
    - JWT-based authentication
    - Role-based access control (user/admin)
    - Session management
+   - See code comments for implementation approach
 
-2. **Payment Integration**
+3. **Payment Integration**
    - Stripe/PayPal integration
    - Webhook handling for payment events
    - Refund processing
 
-3. **Advanced Features**
+4. **Advanced Features**
    - Ticket transfer between users
    - Waitlist for sold-out tiers
-   - Email notifications
+   - Email notifications (booking confirmation, reminders)
    - QR code ticket generation
+   - Dynamic pricing based on demand
 
-4. **Testing**
-   - Unit tests (Jest)
-   - Integration tests (Supertest)
-   - Load testing (k6, Artillery)
-   - E2E tests (Playwright)
+5. **Testing**
+   - Unit tests (Jest) - Services and repositories
+   - Integration tests (Supertest) - API endpoints
+   - Load testing (k6, Artillery) - Concurrent booking scenarios
+   - E2E tests (Playwright) - Full user flows
+   - Chaos engineering - Redis/DB failure scenarios
 
-5. **Monitoring & Observability**
+6. **Monitoring & Observability**
    - Application logging (Winston, Pino)
    - Error tracking (Sentry)
    - Performance monitoring (New Relic, Datadog)
    - Distributed tracing (OpenTelemetry)
+   - Real-time dashboards (Grafana)
+   - Alert system for double-booking detection
 
-6. **DevOps**
+7. **DevOps**
    - Docker containerization
    - CI/CD pipeline (GitHub Actions)
-   - Kubernetes deployment
+   - Kubernetes deployment with auto-scaling
    - Infrastructure as Code (Terraform)
+   - Blue-green deployments for zero-downtime
 
 ## 📝 Project Structure
 

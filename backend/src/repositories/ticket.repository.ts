@@ -84,7 +84,38 @@ export class TicketRepository {
   }
 
   /**
-   * Get available ticket count by tier
+   * Get available tickets for an event and tier, filtering out Redis-locked tickets.
+   *
+   * TODO (Scaling): Implement Redis pre-filter for >50K concurrent users.
+   *
+   * Example implementation:
+   *
+   *   async function getAvailableTickets(eventId: number, tier: string) {
+   *     // 1. Get locked tickets from Redis (fast)
+   *     const lockedTickets = await redis.keys('ticket:*');
+   *     const lockedIds = lockedTickets.map(k => k.split(':')[1]);
+   *
+   *     // 2. Query DB excluding locked tickets
+   *     const placeholders = [eventId, tier];
+   *     let query = `
+   *       SELECT * FROM tickets 
+   *       WHERE event_id = $1 
+   *         AND tier = $2 
+   *         AND status = 'available'
+   *     `;
+   *     if (lockedIds.length > 0) {
+   *       // Dynamic placeholders for ids: $3, $4, ...
+   *       const idPlaceholders = lockedIds.map((_, idx) => `$${idx + 3}`).join(',');
+   *       query += ` AND id NOT IN (${idPlaceholders})`;
+   *       placeholders.push(...lockedIds);
+   *     }
+   *     query += ` ORDER BY id`;
+   *     const available = await db.query(query, placeholders);
+   *
+   *     return available.rows;
+   *   }
+   *
+   * See README.md → "Preventing Double-Booking" for detailed analysis.
    */
   async getAvailableCountByTier(eventId: number, tier: TicketTier): Promise<number> {
     const result = await pool.query(
@@ -97,9 +128,12 @@ export class TicketRepository {
 
   /**
    * Reserve a ticket (set status to pending)
-   * Uses row-level locking with FOR UPDATE SKIP LOCKED to prevent double-booking
-   * This ensures that if two concurrent requests try to book the same ticket,
-   * only one will succeed and the other will get a different ticket or fail.
+   *
+   * TODO (Scaling): Implement Redis Pre-filter for >50K concurrent
+   *
+   * Example implementation: see below.
+   * 
+   * See README.md → "Preventing Double-Booking" for detailed analysis
    */
   async reserveTicket(
     eventId: number,
@@ -194,5 +228,182 @@ export class TicketRepository {
     );
     return result.rows;
   }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // REDIS LOCK APPROACH - FUTURE SCALING IMPLEMENTATION
+  // ═══════════════════════════════════════════════════════════════════
+  // 
+  // The following methods are NOT implemented in current version,
+  // but documented here to demonstrate scaling strategy for >50K concurrent.
+  // 
+  // See README.md → "Preventing Double-Booking → Option 1" for context.
+  
+  /**
+   * TODO (Scaling): Recovery mechanism for Redis failure scenarios
+   * 
+   * PROBLEM: Redis Failure Scenarios
+   * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   * 
+   * Scenario 1: Redis crashes during operation
+   * - All in-memory locks lost
+   * - Tickets appear available while users are still in payment
+   * - Risk: Double booking on those tickets ❌
+   * 
+   * Scenario 2: Redis restart/failover
+   * - Lock state lost if persistence not enabled
+   * - Active reservations (users in payment flow) become invisible
+   * - System shows tickets as available when they're actually reserved
+   * 
+   * Scenario 3: Network partition
+   * - Application can't reach Redis
+   * - Cannot acquire new locks
+   * - Cannot query lock state
+   * - System effectively down ❌
+   * 
+   * SOLUTION: Dual Storage + Recovery Mechanism
+   * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   * 
+   * Hybrid Approach:
+   * 1. Redis: Fast distributed locks (primary)
+   * 2. DB: Persistent record (backup/recovery)
+   * 3. Recovery: Rebuild Redis from DB on failure
+   * 
+   * Implementation Example:
+   * 
+   * // When reserving with Redis lock
+   * async function reserveTicketWithRedis(ticketId, userId) {
+   *   // 1. Acquire Redis lock (fast path)
+   *   const locked = await redis.set(
+   *     `ticket:${ticketId}`, userId, 'EX', 600, 'NX'
+   *   );
+   *   
+   *   if (!locked) {
+   *     throw new Error('Ticket already reserved');
+   *   }
+   *   
+   *   // 2. Persist to DB for durability (important for recovery!)
+   *   try {
+   *     await db.query(`
+   *       INSERT INTO pending_bookings (ticket_id, user_id, expires_at)
+   *       VALUES ($1, $2, NOW() + INTERVAL '10 minutes')
+   *       ON CONFLICT (ticket_id) DO NOTHING
+   *     `, [ticketId, userId]);
+   * 
+   *   // Note: DB remains status='available'
+   *   // Redis is source of truth for "reserved" state (= current DB status 'pending')
+   *   // On confirm: Update DB to 'booked' + clear Redis
+   *   // On timeout: Redis TTL expires (auto-release)
+   * 
+   *   } catch (error) {
+   *     // If DB write fails, rollback Redis lock
+   *     await redis.del(`ticket:${ticketId}`);
+   *     throw error;
+   *   }
+   * }
+   * 
+   * // Recovery mechanism (on Redis failure)
+   * async function recoverFromRedisFailure() {
+   *   console.log('Redis failure detected, rebuilding lock state from DB...');
+   *   
+   *   // Load all active reservations from DB back to Redis
+   *   // Only recover reservations that haven't expired yet
+   *   const pending = await db.query(`
+   *     SELECT 
+   *       ticket_id, 
+   *       user_id, 
+   *       EXTRACT(EPOCH FROM (expires_at - NOW())) as ttl_seconds
+   *     FROM pending_bookings
+   *     WHERE expires_at > NOW()
+   *   `);
+   *   
+   *   let recovered = 0;
+   *   for (const booking of pending.rows) {
+   *     try {
+   *       // Restore lock to Redis with remaining TTL
+   *       // Math.max(1, ttl) ensures at least 1 second TTL
+   *       await redis.setex(
+   *         `ticket:${booking.ticket_id}`,
+   *         Math.max(1, Math.floor(booking.ttl_seconds)),
+   *         booking.user_id
+   *       );
+   *       recovered++;
+   *     } catch (error) {
+   *       console.error(`Failed to recover ticket ${booking.ticket_id}:`, error);
+   *     }
+   *   }
+   *   
+   *   console.log(`Recovery complete: ${recovered} ticket locks restored`);
+   *   
+   *   // Clean up expired records from DB
+   *   await db.query(`
+   *     DELETE FROM pending_bookings
+   *     WHERE expires_at < NOW()
+   *   `);
+   * }
+   * 
+   * WHY THIS MATTERS:
+   * ────────────────
+   * 
+   * Without recovery:
+   * - Redis crashes at 10:00 AM
+   * - 1,000 users in payment flow (locks held in Redis)
+   * - Redis restarts at 10:01 AM with empty state
+   * - All 1,000 tickets show as available
+   * - New users can book same tickets → DOUBLE BOOKING! ❌
+   * 
+   * With recovery:
+   * - Redis crashes at 10:00 AM
+   * - Recovery runs automatically on Redis reconnect
+   * - Loads 1,000 active reservations from pending_bookings table
+   * - Restores locks to Redis with remaining TTL
+   * - System continues normally → NO DOUBLE BOOKING ✅
+   * 
+   * RECOVERY TRIGGERS:
+   * ──────────────────
+   * 1. Redis reconnection after crash
+   * 2. Application startup (load existing state)
+   * 3. Periodic health check (detect drift)
+   * 4. Manual trigger (ops tool)
+   * 
+   * ADDITIONAL CONSIDERATIONS:
+   * ──────────────────────────
+   * 
+   * 1. Race condition during recovery:
+   *    - User completes payment while recovery running
+   *    - Solution: Use Redis NX flag (only set if not exists)
+   * 
+   * 2. DB table needed:
+   *    CREATE TABLE pending_bookings (
+   *      ticket_id INT PRIMARY KEY,
+   *      user_id INT NOT NULL,
+   *      created_at TIMESTAMP DEFAULT NOW(),
+   *      expires_at TIMESTAMP NOT NULL,
+   *      INDEX idx_expires (expires_at)
+   *    );
+   * 
+   * 3. Cleanup job for expired records:
+   *    - Cron job every 5 minutes
+   *    - DELETE FROM pending_bookings WHERE expires_at < NOW()
+   *    - Keeps table size manageable
+   * 
+   * 4. Redis persistence configuration:
+   *    - Enable AOF (Append-Only File) for durability
+   *    - Enable RDB snapshots as backup
+   *    - Reduces need for recovery (data survives restart)
+   * 
+   * TRADE-OFF ANALYSIS:
+   * ───────────────────
+   * 
+   * | Aspect | Redis-Only | Redis + DB Backup |
+   * |--------|-----------|-------------------|
+   * | **Write Latency** | 1-2ms ✅ | 10-15ms (Redis + async DB) |
+   * | **Recovery** | ❌ Data loss on crash | ✅ Full recovery possible |
+   * | **Complexity** | Simple | Medium (two systems) |
+   * | **Durability** | ❌ Volatile | ✅ Persistent |
+   * | **Best For** | Non-critical locks | Critical bookings ✅ |
+   * 
+   * 
+   * See README.md → "Scalability Considerations → Redis-Based Ticket Lock"
+   */
 }
 
