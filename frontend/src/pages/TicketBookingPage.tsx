@@ -137,13 +137,21 @@ export const TicketBookingPage: React.FC = () => {
           fetchAvailableTickets();
         }, 3000);
       } else {
-        setError(response.data.data.message);
+        // Payment failed - refresh tickets and show error
+        const errorMessage = response.data.data.message;
+        setBookingMessage(null);
         setBookingStep('select');
         setReservedTickets([]);
-        fetchAvailableTickets();
+        await fetchAvailableTickets();
+        setError(errorMessage);
       }
     } catch (err: any) {
-      setError(err.response?.data?.error?.message || 'Failed to confirm booking');
+      const errorMessage = err.response?.data?.error?.message || 'Failed to confirm booking';
+      setBookingMessage(null);
+      setBookingStep('select');
+      setReservedTickets([]);
+      await fetchAvailableTickets();
+      setError(errorMessage);
     } finally {
       setIsProcessing(false);
     }
