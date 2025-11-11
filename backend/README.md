@@ -190,6 +190,65 @@ JWT (JSON Web Token) authentication provides:
 
 See inline code comments in controllers for specific implementation points.
 
+### Ticket ID Strategy
+
+**Current Implementation:** PostgreSQL `SERIAL` (auto-increment integer) for ticket IDs.
+
+**Limitations for Distributed Systems:**
+
+PostgreSQL SERIAL IDs work well for single-instance deployments but have critical limitations in distributed architectures:
+
+1. **No Global Uniqueness**: Each database instance generates its own sequence, causing ID collisions across data centers
+2. **Not Idempotent**: Retry logic creates duplicate tickets with different IDs
+3. **Coordination Overhead**: Requires expensive distributed sequence coordination
+4. **Sharding Complexity**: Makes database partitioning difficult
+
+**Alternative Approaches:**
+
+| Approach | Best For | Key Benefit |
+|----------|----------|-------------|
+| **PostgreSQL SERIAL** (current) | Single-instance systems | Simple, built-in |
+| **UUID (v4)** | Systems prioritizing simplicity | Globally unique, no coordination |
+| **Snowflake-like ID** | Distributed systems at scale | Globally unique, time-sortable, compact |
+
+**Snowflake-like ID Benefits:**
+- Globally unique without coordination
+- Time-sortable (can extract creation timestamp)
+- Compact (64-bit integer vs 128-bit UUID)
+- High throughput (4096 IDs/ms per machine)
+- Idempotent-friendly
+
+**Structure:**
+```
+64-bit: Timestamp(41) + DataCenter(5) + Machine(5) + Sequence(12)
+```
+
+**Migration Path:**
+
+If migrating to globally unique IDs for distributed deployment:
+
+1. **Add unique ID column:** Add `ticket_unique_id VARCHAR(20) UNIQUE` to tickets table with index
+   
+2. **Create ID generator:** Implement Snowflake-like generator in `src/utils/idGenerator.ts` with timestamp, datacenter, machine, and sequence components
+
+3. **Update ticket creation:** Modify `TicketRepository.createBulk()` to generate unique IDs before insertion (see code comments in `src/repositories/ticket.repository.ts`)
+
+4. **Update service layer:** Generate IDs in `TicketService.createTickets()` before calling repository (see code comments in `src/services/ticket.service.ts`)
+
+5. **Migrate API gradually:**
+   - Keep SERIAL ID for internal database relationships
+   - Expose unique ID to external APIs  
+   - Update frontend to use unique IDs
+
+6. **Consider existing solutions:** npm packages like `snowflake-id`, `uid-generator`, or `uuid` for faster implementation
+
+**When to Implement:**
+- ✅ Before multi-region deployment
+- ✅ When implementing database sharding
+- ⚠️ Not critical for current single-instance take-home exam
+
+See inline code comments in ticket repository for implementation points.
+
 ### Validation
 Request validation is done using Joi schemas in the validators directory.
 

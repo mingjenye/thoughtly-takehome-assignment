@@ -15,6 +15,29 @@ export class TicketService {
   /**
    * Create tickets for an event
    * This is the admin/setup function to populate tickets
+   * 
+   * TODO (Distributed Systems): Generate globally unique IDs here
+   * 
+   * Current: Tickets get PostgreSQL SERIAL IDs
+   *   - Simple for single-instance deployment
+   *   - Works for current take-home exam scope
+   * 
+   * For distributed systems, generate unique IDs before repository call:
+   *   const ticketsToCreate = [];
+   *   for (let i = 0; i < vipCount; i++) {
+   *     ticketsToCreate.push({
+   *       event_id: eventId,
+   *       tier: 'VIP',
+   *       ticket_unique_id: idGenerator.generateId().toString()
+   *     });
+   *   }
+   * 
+   * This would enable:
+   *   - Multiple data centers creating tickets simultaneously
+   *   - Idempotent ticket creation (retry-safe)
+   *   - Database sharding without ID conflicts
+   * 
+   * See backend/README.md → "Ticket ID Strategy" for implementation details
    */
   async createTickets(data: {
     eventId: number;
@@ -53,6 +76,7 @@ export class TicketService {
       }
 
       // Bulk create tickets
+      // TODO (Distributed Systems): Pass unique IDs to repository
       const tickets = await this.ticketRepository.createBulk(ticketsToCreate);
 
       // Update event available counts

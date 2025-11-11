@@ -289,7 +289,88 @@ JWT (JSON Web Token) authentication provides several advantages:
 **Rationale:** Simplifies the system while demonstrating core booking functionality.
 **Scalability:** Database schema supports multiple events, easy to extend.
 
-### 3. Row-Level Locking vs. Optimistic Locking
+### 3. Ticket ID Strategy (PostgreSQL SERIAL vs. Globally Unique IDs)
+
+**Decision:** Ticket IDs are currently generated using PostgreSQL's `SERIAL` (auto-increment integer) type.
+- **How it works:** Each new ticket receives a unique, sequential integer ID (e.g., 1, 2, 3...) directly from the database.
+- **Why this?** Simple, fast, and reliable for a single-instance (non-distributed) PostgreSQL deployment, fitting our current architecture.
+- **Limitation:** This approach does not provide global uniqueness and is not suitable for distributed or sharded deployments.
+
+**Limitations in Distributed Systems:**
+
+When scaling a ticketing system beyond a single database instance, traditional PostgreSQL `SERIAL` (auto-increment integer) IDs present several challenges:
+
+- **No Global Uniqueness:** Multiple database instances can generate the same SERIAL ID, leading to collisions, sharding complications, and reconciling issues.
+- **Not Idempotent:** Retried or replayed requests may result in new IDs and accidental duplicates, which complicates data merging and reconciliation across regions.
+- **Coordination Overhead:** Distributing SERIAL sequences across instances requires complex and fragile coordination logic, which adds latency, introduces new single points of failure, and risks inconsistency.
+- **Predictability and Insecurity:** Sequential IDs can be guessed easily—exposing total sales volume and leaking business-sensitive information through public endpoints.
+
+**Why Choose Globally Unique IDs?**
+
+Transitioning to globally unique IDs (such as UUIDs or Snowflake-like IDs) solves these distributed system problems and unlocks the following advantages:
+
+- **Idempotency:** The same request deterministically generates the same ID, preventing duplicate bookings or data corruption.
+- **No Coordination Needed:** Each service or database instance can independently generate IDs, eliminating coordination bottlenecks and allowing safer horizontal scaling.
+- **Merge and Partition Friendliness:** Data from multiple regions or shards can be safely merged and easily partitioned using the ID, simplifying multi-database operations.
+- **Improved Security:** IDs are less predictable, reducing the risk of enumeration and exposure of business data.
+
+> **In summary:** Globally unique IDs are essential for distributed, scalable, and secure ticketing systems. They ensure that data across different regions, instances, or scaling scenarios remains unique, conflict-free, and easy to manage without centralized coordination.
+
+**Alternative Approaches:**
+
+| Approach | Pros | Cons | Best For |
+|----------|------|------|----------|
+| **PostgreSQL SERIAL** (current) | ✅ Simple<br>✅ Sequential<br>✅ Efficient for single DB | ❌ Not globally unique<br>❌ Coordination needed<br>❌ Sharding complexity | Single-instance systems |
+| **UUID (v4)** | ✅ Globally unique<br>✅ No coordination<br>✅ Industry standard | ❌ Long (36 chars)<br>❌ Not sortable by time<br>❌ Poor DB index performance | Systems prioritizing simplicity |
+| **Snowflake-like ID** | ✅ Globally unique<br>✅ Short & compact<br>✅ Time-sortable<br>✅ No coordination<br>✅ High performance | ⚠️ Requires custom implementation<br>⚠️ Clock synchronization needed | Distributed systems at scale |
+
+**Snowflake-like ID Structure:**
+
+```
+64-bit ID composition:
+┌─────────────┬──────────┬──────────┬──────────────┐
+│  Timestamp  │ Data     │ Machine  │  Sequence    │
+│  (41 bits)  │ Center   │ ID       │  Number      │
+│             │ (5 bits) │ (5 bits) │  (12 bits)   │
+└─────────────┴──────────┴──────────┴──────────────┘
+
+Example: 1234567890123456789
+         ├─ When created (sortable by time)
+         ├─ Which data center
+         ├─ Which machine
+         └─ Sequence within millisecond
+```
+
+**Benefits of Snowflake-like IDs:**
+- **Collision-Free**: Timestamp + datacenter + machine + sequence ensures uniqueness
+- **Time-Trackable**: Can extract creation time from ID
+- **Short & Readable**: 64-bit integer (vs 128-bit UUID)
+- **Sortable**: IDs generated later have higher values
+- **High Throughput**: 4096 IDs per millisecond per machine
+- **No DB Round-trip**: Generated in application layer
+
+**Trade-offs: UUID vs. Snowflake-like ID**
+
+| Aspect | UUID (v4) | Snowflake-like ID |
+|--------|-----------|-------------------|
+| **Global Uniqueness** | ✅ Guaranteed (random) | ✅ Guaranteed (timestamp-based) |
+| **Implementation** | ✅ Built-in (Node.js crypto) | ⚠️ Custom generator needed |
+| **ID Length** | ❌ Long (36 chars, 128-bit) | ✅ Compact (19 digits, 64-bit) |
+| **Time Sortable** | ❌ Random, not sortable | ✅ Chronologically ordered |
+| **Performance** | ✅ Fast generation | ✅ Fast (no DB call) |
+| **Database Indexing** | ⚠️ Poor B-tree performance | ✅ Good sequential indexing |
+| **Human Readable** | ❌ Hard to read/remember | ✅ Easier to communicate |
+| **Collision Risk** | ~0 (cryptographic random) | ~0 (timestamp + machine + seq) |
+| **Clock Dependency** | ✅ No clock sync needed | ⚠️ Requires clock synchronization |
+| **Observability** | ❌ Can't extract metadata | ✅ Can extract creation time |
+
+**When to Migrate:**
+
+- ✅ **Now (for learning)**: Demonstrates distributed system design thinking
+- ✅ **Before multi-region deployment**: Essential for global scale
+- ✅ **When sharding database**: Enables partition-friendly IDs
+
+### 4. Row-Level Locking vs. Optimistic Locking
 **Decision:** Pessimistic locking with `FOR UPDATE SKIP LOCKED`.
 **Rationale:**
 - ✅ Guarantees no double-booking
@@ -298,7 +379,7 @@ JWT (JSON Web Token) authentication provides several advantages:
 - ❌ Slightly lower throughput than optimistic locking
 **Alternative:** Optimistic locking with version numbers would require retry logic.
 
-### 4. Two-Step Booking (Reserve → Confirm)
+### 5. Two-Step Booking (Reserve → Confirm)
 **Decision:** Separate reserve and confirm steps.
 **Rationale:**
 - Mimics real-world payment flow
@@ -306,7 +387,7 @@ JWT (JSON Web Token) authentication provides several advantages:
 - Can release tickets if payment fails
 **Trade-off:** Tickets temporarily unavailable during payment (acceptable for this use case).
 
-### 5. In-Memory vs. Database Queue
+### 6. In-Memory vs. Database Queue
 **Decision:** Direct database transactions, no message queue.
 **Rationale:**
 - Sufficient for ~50K concurrent users
