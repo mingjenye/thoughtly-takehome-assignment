@@ -1,0 +1,171 @@
+# Backend API
+
+Node.js/Express backend API with TypeScript and PostgreSQL.
+
+## Setup
+
+### 1. Install Dependencies
+```bash
+npm install
+```
+
+### 2. Environment Variables
+Create a `.env` file in the backend directory:
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your configuration:
+```env
+PORT=3001
+NODE_ENV=development
+DATABASE_URL=postgresql://username:password@localhost:5432/takehome_db
+JWT_SECRET=your-secret-key-here
+JWT_EXPIRES_IN=7d
+FRONTEND_URL=http://localhost:3000
+```
+
+### 3. Database Setup
+
+#### Create Database
+```bash
+# Using psql
+psql -U postgres
+CREATE DATABASE takehome_db;
+\q
+```
+
+#### Run Migrations
+```bash
+# Option 1: Using psql
+psql -U postgres -d takehome_db -f ../database/migrations/001_create_users_table.sql
+psql -U postgres -d takehome_db -f ../database/migrations/002_create_items_table.sql
+
+# Option 2: Using npm script (if configured)
+npm run migrate
+```
+
+#### Seed Database (Optional)
+```bash
+psql -U postgres -d takehome_db -f ../database/seeds/001_seed_data.sql
+# or
+npm run seed
+```
+
+### 4. Start Development Server
+```bash
+npm run dev
+```
+
+Server will run on `http://localhost:3001`
+
+## Available Scripts
+
+- `npm run dev` - Start development server with auto-reload
+- `npm run build` - Build TypeScript to JavaScript
+- `npm start` - Start production server
+- `npm test` - Run tests
+- `npm run lint` - Run ESLint
+- `npm run lint:fix` - Fix linting errors
+
+## Project Structure
+
+```
+backend/
+├── src/
+│   ├── controllers/      # Route handlers
+│   ├── services/         # Business logic
+│   ├── repositories/     # Data access layer
+│   ├── middleware/       # Express middleware
+│   ├── routes/           # API routes
+│   ├── validators/       # Request validation schemas
+│   ├── config/           # Configuration files
+│   ├── types/            # TypeScript type definitions
+│   ├── utils/            # Helper functions
+│   ├── app.ts            # Express app setup
+│   └── server.ts         # Server entry point
+└── package.json
+```
+
+## API Endpoints
+
+### Authentication
+- `POST /api/v1/auth/register` - Register new user
+- `POST /api/v1/auth/login` - Login user
+- `POST /api/v1/auth/logout` - Logout user
+
+### Items
+- `GET /api/v1/items` - Get all items (requires auth)
+- `GET /api/v1/items/:id` - Get item by ID (requires auth)
+- `POST /api/v1/items` - Create item (requires auth)
+- `PUT /api/v1/items/:id` - Update item (requires auth)
+- `DELETE /api/v1/items/:id` - Delete item (requires auth)
+
+### Health Check
+- `GET /health` - Health check endpoint
+
+## Testing the API
+
+### Using curl
+
+#### Register a user
+```bash
+curl -X POST http://localhost:3001/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"password123","name":"Test User"}'
+```
+
+#### Login
+```bash
+curl -X POST http://localhost:3001/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"password123"}'
+```
+
+#### Create an item (with auth token)
+```bash
+curl -X POST http://localhost:3001/api/v1/items \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN_HERE" \
+  -d '{"title":"New Item","description":"Item description","status":"pending"}'
+```
+
+## Development Notes
+
+### Architecture Pattern
+This backend follows the Controller → Service → Repository pattern:
+
+- **Controllers**: Handle HTTP requests/responses
+- **Services**: Contain business logic
+- **Repositories**: Handle database operations
+
+### Error Handling
+All errors are handled by the centralized error handler middleware. Custom error classes are available:
+- `BadRequestError` (400)
+- `UnauthorizedError` (401)
+- `ForbiddenError` (403)
+- `NotFoundError` (404)
+- `ConflictError` (409)
+- `ValidationError` (422)
+
+### Authentication
+JWT-based authentication. Include token in Authorization header:
+```
+Authorization: Bearer YOUR_TOKEN_HERE
+```
+
+### Validation
+Request validation is done using Joi schemas in the validators directory.
+
+## Troubleshooting
+
+### Database Connection Issues
+- Ensure PostgreSQL is running
+- Verify DATABASE_URL in .env
+- Check database exists and credentials are correct
+
+### Port Already in Use
+Change PORT in .env file if 3001 is already in use
+
+### TypeScript Errors
+Run `npm run build` to check for type errors

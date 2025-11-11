@@ -1,0 +1,163 @@
+import pool from '../config/database';
+
+export type TicketTier = 'VIP' | 'Front Row' | 'GA';
+export type TicketStatus = 'available' | 'pending' | 'booked';
+
+export interface Ticket {
+  id: number;
+  event_id: number;
+  tier: TicketTier;
+  status: TicketStatus;
+  user_id: number | null;
+  booked_at: Date | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface CreateTicketData {
+  event_id: number;
+  tier: TicketTier;
+}
+
+export class TicketRepository {
+  /**
+   * Create multiple tickets for an event
+   */
+  async createBulk(tickets: CreateTicketData[]): Promise<Ticket[]> {
+    const values = tickets.map(t => `(${t.event_id}, '${t.tier}')`).join(',');
+    
+    const result = await pool.query(
+      `INSERT INTO tickets (event_id, tier) 
+       VALUES ${values}
+       RETURNING *`
+    );
+    
+    return result.rows;
+  }
+
+  /**
+   * Get all available tickets for an event grouped by tier
+   */
+  async findAvailableByEvent(eventId: number): Promise<Ticket[]> {
+    const result = await pool.query(
+      `SELECT * FROM tickets 
+       WHERE event_id = $1 AND status = 'available'
+       ORDER BY tier, id`,
+      [eventId]
+    );
+    return result.rows;
+  }
+
+  /**
+   * Get available ticket count by tier
+   */
+  async getAvailableCountByTier(eventId: number, tier: TicketTier): Promise<number> {
+    const result = await pool.query(
+      `SELECT COUNT(*) as count FROM tickets 
+       WHERE event_id = $1 AND tier = $2 AND status = 'available'`,
+      [eventId, tier]
+    );
+    return parseInt(result.rows[0].count);
+  }
+
+  /**
+   * Reserve a ticket (set status to pending)
+   * Uses row-level locking with FOR UPDATE SKIP LOCKED to prevent double-booking
+   * This ensures that if two concurrent requests try to book the same ticket,
+   * only one will succeed and the other will get a different ticket or fail.
+   */
+  async reserveTicket(
+    eventId: number,
+    tier: TicketTier,
+    userId: number,
+    client: any
+  ): Promise<Ticket | null> {
+    // Find an available ticket with row-level lock
+    // SKIP LOCKED ensures we skip tickets that are locked by other transactions
+    const result = await client.query(
+      `UPDATE tickets 
+       SET status = 'pending', user_id = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = (
+         SELECT id FROM tickets 
+         WHERE event_id = $2 AND tier = $3 AND status = 'available'
+         ORDER BY id
+         LIMIT 1
+         FOR UPDATE SKIP LOCKED
+       )
+       RETURNING *`,
+      [userId, eventId, tier]
+    );
+    
+    return result.rows[0] || null;
+  }
+
+  /**
+   * Confirm ticket booking (set status to booked)
+   */
+  async confirmBooking(ticketId: number, client?: any): Promise<Ticket> {
+    const dbClient = client || pool;
+    
+    const result = await dbClient.query(
+      `UPDATE tickets 
+       SET status = 'booked', booked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING *`,
+      [ticketId]
+    );
+    
+    return result.rows[0];
+  }
+
+  /**
+   * Cancel ticket reservation (set status back to available)
+   */
+  async cancelReservation(ticketId: number, client?: any): Promise<Ticket> {
+    const dbClient = client || pool;
+    
+    const result = await dbClient.query(
+      `UPDATE tickets 
+       SET status = 'available', user_id = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING *`,
+      [ticketId]
+    );
+    
+    return result.rows[0];
+  }
+
+  /**
+   * Find ticket by ID
+   */
+  async findById(ticketId: number): Promise<Ticket | null> {
+    const result = await pool.query(
+      'SELECT * FROM tickets WHERE id = $1',
+      [ticketId]
+    );
+    return result.rows[0] || null;
+  }
+
+  /**
+   * Get ticket with row-level lock (FOR UPDATE)
+   */
+  async findByIdForUpdate(ticketId: number, client: any): Promise<Ticket | null> {
+    const result = await client.query(
+      'SELECT * FROM tickets WHERE id = $1 FOR UPDATE',
+      [ticketId]
+    );
+    return result.rows[0] || null;
+  }
+
+  /**
+   * Get all tickets for a user
+   */
+  async findByUserId(userId: number): Promise<Ticket[]> {
+    const result = await pool.query(
+      `SELECT * FROM tickets 
+       WHERE user_id = $1 AND status IN ('pending', 'booked')
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+    return result.rows;
+  }
+}
+
